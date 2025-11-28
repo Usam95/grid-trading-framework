@@ -1,4 +1,4 @@
-# utilities/data_utils/data_source.py
+# infra/data_source.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+
+from infra.logging_setup import get_logger
 
 # Root folder where all historical data is stored:
 #   historical_data/<SYMBOL>/<SYMBOL>.parquet.gzip
@@ -47,6 +49,7 @@ class LocalFileDataSource:
 
     def __init__(self, root: Path | str = HIST_DATA_ROOT) -> None:
         self.root = Path(root)
+        self.log = get_logger("data")
 
     # ------------------------------------------------------------------
     # Low-level file discovery
@@ -60,21 +63,33 @@ class LocalFileDataSource:
         2. <root>/<symbol>/<symbol>.csv
         """
         symbol_dir = self.root / symbol
+        self.log.debug(
+            "Looking for data for symbol=%s under %s",
+            symbol,
+            symbol_dir,
+        )
+
         if not symbol_dir.is_dir():
-            raise FileNotFoundError(f"No folder found for symbol {symbol!r} under {self.root}")
+            msg = f"No folder found for symbol {symbol!r} under {self.root}"
+            self.log.error(msg)
+            raise FileNotFoundError(msg)
 
         parquet_candidate = symbol_dir / f"{symbol}.parquet.gzip"
         csv_candidate = symbol_dir / f"{symbol}.csv"
 
         if parquet_candidate.is_file():
+            self.log.info("Using parquet data file for %s: %s", symbol, parquet_candidate)
             return parquet_candidate
         if csv_candidate.is_file():
+            self.log.info("Using CSV data file for %s: %s", symbol, csv_candidate)
             return csv_candidate
 
-        raise FileNotFoundError(
+        msg = (
             f"No data file found for symbol {symbol!r} in {symbol_dir}. "
             f"Expected {symbol}.parquet.gzip or {symbol}.csv"
         )
+        self.log.error(msg)
+        raise FileNotFoundError(msg)
 
     # ------------------------------------------------------------------
     # High-level load entry point
@@ -84,6 +99,13 @@ class LocalFileDataSource:
         Load data for the given DatasetConfig and return a sliced DataFrame.
         """
         data_path = self.find_file_for_symbol(cfg.symbol)
+        self.log.info(
+            "Loading data for symbol=%s from %s (requested: start=%s, end=%s)",
+            cfg.symbol,
+            data_path,
+            cfg.start,
+            cfg.end,
+        )
 
         # Determine file type by suffixes (.parquet.gzip vs .csv)
         suffixes = data_path.suffixes
@@ -92,7 +114,9 @@ class LocalFileDataSource:
         elif data_path.suffix == ".csv":
             df = pd.read_csv(data_path, parse_dates=["Date"], index_col="Date")
         else:
-            raise ValueError(f"Unsupported file format for {data_path}")
+            msg = f"Unsupported file format for {data_path}"
+            self.log.error(msg)
+            raise ValueError(msg)
 
         # Ensure DatetimeIndex and sorted index
         if not isinstance(df.index, pd.DatetimeIndex):
@@ -100,7 +124,9 @@ class LocalFileDataSource:
                 df["Date"] = pd.to_datetime(df["Date"])
                 df.set_index("Date", inplace=True)
             else:
-                raise ValueError(f"Data for {cfg.symbol} has no DatetimeIndex and no 'Date' column.")
+                msg = f"Data for {cfg.symbol} has no DatetimeIndex and no 'Date' column."
+                self.log.error(msg)
+                raise ValueError(msg)
 
         df.sort_index(inplace=True)
 
@@ -117,11 +143,24 @@ class LocalFileDataSource:
         sliced = df.loc[start:end]
 
         if sliced.empty:
-            raise ValueError(
+            msg = (
                 f"No data for {cfg.symbol} in requested range "
                 f"({cfg.start=} – {cfg.end=}). Available range is "
                 f"{df.index[0]} – {df.index[-1]}"
             )
+            self.log.error(msg)
+            raise ValueError(msg)
+
+        self.log.info(
+            "Loaded %d rows for %s. Available range=%s → %s. Returned slice=%s → %s (%d rows).",
+            len(df),
+            cfg.symbol,
+            df.index[0],
+            df.index[-1],
+            sliced.index[0],
+            sliced.index[-1],
+            len(sliced),
+        )
 
         return sliced
 
@@ -129,6 +168,7 @@ class LocalFileDataSource:
 # ----------------------------------------------------------------------
 # Backwards-compatible helpers (optional)
 # ----------------------------------------------------------------------
+
 
 def get_path(ticker: str) -> Path:
     """
@@ -165,22 +205,18 @@ def load_data(dataset_conf: DatasetConfig) -> pd.DataFrame:
     ds = LocalFileDataSource()
     return ds.load(cfg)
 
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Iterable, List, Optional
 
 # ----------------------------------------------------------------------
 # Example CLI usage
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
-    # Example: download several spot symbols from 2018-01-01 until now
     ds = LocalFileDataSource()
     cfg = DatasetConfig(
         symbol="XRPUSDT",
-        start="2025-11-1",
+        start="2021-11-1",
         end="2025-11-20",
     )
     df = ds.load(cfg)
 
-    print(df)
+    print(df.head())
     print(len(df))  # should be close to 1T (1 minute) or None but spaced by 1 min

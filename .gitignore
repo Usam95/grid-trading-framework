@@ -1,0 +1,67 @@
+# -------------------------
+# Python bytecode / cache
+# -------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# -------------------------
+# Virtual environments
+# -------------------------
+.venv/
+venv/
+env/
+.env/
+.conda/
+.venv*/
+venv*/
+
+# -------------------------
+# Test / coverage artifacts
+# -------------------------
+.pytest_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.pytype/
+.nox/
+
+# -------------------------
+# IDE / editor files
+# -------------------------
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+
+# -------------------------
+# OS-specific junk
+# -------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# -------------------------
+# Logs / results / temp
+# -------------------------
+logs/
+results/
+*.log
+
+# -------------------------
+# Large / local data
+# -------------------------
+historical_data/
+data/
+*.parquet
+*.parquet.gzip
+
+# -------------------------
+# Misc
+# -------------------------
+*.tmp
+*.bak
+*.orig

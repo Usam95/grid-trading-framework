@@ -264,7 +264,7 @@ if __name__ == "__main__":
     client = BinanceMarketDataClient(futures=False)
     downloader = BinanceHistoricalDownloader(client)
 
-    start = datetime(2025, 11, 1)
+    start = datetime(2021, 1, 1)
     end = datetime.now()
 
     symbols: Iterable[str] = ["XRPUSDT"]

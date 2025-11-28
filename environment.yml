@@ -1,0 +1,28 @@
+name: backtester
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Core
+  - python=3.11
+  - pip
+
+  # Data & numeric utils (for CSV, metrics, etc.)
+  - numpy
+  - pandas
+  - python-dateutil
+
+  # Config & utilities
+  - pyyaml        # load YAML configs
+  - pytest        # unit tests
+
+  # (Optional but useful later)
+  - matplotlib  # plots for equity curves, etc.
+  - tqdm        # progress bars
+  - rich        # nice CLI output / logging
+
+  # Things we’ll likely need later for live trading & notifications
+  - pip:
+      - python-binance        # Binance API client (REST + WebSocket)
+      - python-telegram-bot   # Telegram notifications
