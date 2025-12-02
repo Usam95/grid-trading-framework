@@ -2,8 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-
-import pytest
+import inspect
 
 from core.models import (
     Candle,
@@ -29,11 +28,8 @@ def make_candle(price: float = 1.0) -> Candle:
 
 
 def make_account(balance: float = 1_000.0) -> AccountState:
-    return AccountState(
-        balance=balance,
-        equity=balance,
-        margin_used=0.0,
-    )
+    # Use positional args to avoid coupling to internal field names.
+    return AccountState(balance, balance, 0.0)
 
 
 def test_initial_grid_builds_orders_on_first_candle():
@@ -52,7 +48,6 @@ def test_initial_grid_builds_orders_on_first_candle():
     orders = strat.on_candle(candle, account)
 
     # --- basic sanity checks ---
-    # In your implementation, n_levels = total levels (not per side).
     assert len(orders) == cfg.n_levels
 
     # All orders for same symbol and quantity
@@ -113,7 +108,6 @@ def test_on_order_filled_deactivates_grid_level():
     filled_order = orders[0]
 
     # Ensure this order is tracked in internal mapping
-    # Adjust the attribute name if your implementation differs
     assert filled_order.id in strat._order_to_level
 
     grid_level_before = strat._order_to_level[filled_order.id]
@@ -129,7 +123,12 @@ def test_on_order_filled_deactivates_grid_level():
         position_id=None,
     )
 
-    strat.on_order_filled(event)
+    # Support both (event) and (event, account) signatures
+    sig = inspect.signature(strat.on_order_filled)
+    if len(sig.parameters) == 1:
+        strat.on_order_filled(event)
+    else:
+        strat.on_order_filled(event, account)
 
     grid_level_after = strat._order_to_level[filled_order.id]
     assert grid_level_after.active is False

@@ -1,7 +1,6 @@
 # backtest/engine.py
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional
 from uuid import uuid4
@@ -20,39 +19,12 @@ from core.models import (
 )
 from core.strategy.base import IStrategy
 from infra.data_source import LocalFileDataSource, DatasetConfig
-from backtest.config import BacktestConfig
+from infra.config import BacktestEngineConfig, LocalDataConfig
 from infra.logging_setup import get_logger
 
-# --------------------------------------------------------------------
-# Result objects
-# --------------------------------------------------------------------
-
-
-@dataclass
-class TradeRecord:
-    position_id: str
-    symbol: str
-    side: PositionSide
-    size: float
-    entry_price: float
-    exit_price: float
-    entry_time: datetime
-    exit_time: datetime
-    realized_pnl: float
-    total_fees: float
-
-
-@dataclass
-class BacktestResult:
-    trades: List[TradeRecord]
-    equity_curve: List[tuple[datetime, float]]
-    positions: List[Position]
-    raw_orders: List[Order]
-
-
-# --------------------------------------------------------------------
-# Backtest Engine
-# --------------------------------------------------------------------
+from core.results.models import BacktestResult, EquityPoint
+from core.results.trade_builder import TradeBuilder
+from core.results.metrics import MetricRegistry, create_default_metric_registry
 
 
 class BacktestEngine:
@@ -68,27 +40,35 @@ class BacktestEngine:
 
     def __init__(
         self,
-        config: BacktestConfig,
-        data_source: Optional[LocalFileDataSource],
+        engine_cfg: BacktestEngineConfig,
+        data_cfg: LocalDataConfig,
         strategy: IStrategy,
+        data_source: Optional[LocalFileDataSource] = None,
+        metric_registry: Optional[MetricRegistry] = None,
     ):
-        self.config = config
-        self.data_source = data_source or LocalFileDataSource()
+        self.engine_cfg = engine_cfg
+        self.data_cfg = data_cfg
         self.strategy = strategy
+        self.data_source = data_source or LocalFileDataSource()
         self.log = get_logger("backtest.engine")
 
-        # Engine state – use new AccountState fields
+        # Metrics
+        self.metric_registry = metric_registry or create_default_metric_registry()
+
+        # Engine state – use AccountState fields
         self.account = AccountState(
-            cash_balance=config.initial_balance,
-            total_value=config.initial_balance,
+            cash_balance=self.engine_cfg.initial_balance,
+            total_value=self.engine_cfg.initial_balance,
             invested_cost=0.0,
         )
 
         self._open_orders: Dict[str, Order] = {}
         self._open_positions: Dict[str, Position] = {}  # id -> Position
-        self._trade_records: List[TradeRecord] = []
-        self._equity_curve: List[tuple[datetime, float]] = []
+        self._equity_curve: List[EquityPoint] = []
         self._all_orders: List[Order] = []
+
+        # Trade builder (logical trades from fills)
+        self._trade_builder = TradeBuilder(symbol=self.data_cfg.symbol)
 
     # ----------------------------------------------------------------
     # Public API
@@ -97,13 +77,15 @@ class BacktestEngine:
         """
         Run the full backtest and return BacktestResult.
         """
+        started_at = datetime.now()
+
         self.log.info(
             "Backtest started: symbol=%s, start=%s, end=%s, initial_balance=%.2f, fee_pct=%.5f",
-            self.config.symbol,
-            self.config.start,
-            self.config.end,
-            self.config.initial_balance,
-            self.config.trading_fee_pct,
+            self.data_cfg.symbol,
+            self.data_cfg.start,
+            self.data_cfg.end,
+            self.engine_cfg.initial_balance,
+            self.engine_cfg.trading_fee_pct,
         )
 
         df = self._load_raw_data()
@@ -111,11 +93,18 @@ class BacktestEngine:
         self.log.info(
             "Converted dataframe to %d candles for symbol=%s",
             len(candles),
-            self.config.symbol,
+            self.data_cfg.symbol,
         )
 
         # Main backtest loop
-        for candle in candles:
+        for idx, candle in enumerate(candles):
+            # Optional: support max_candles in engine_cfg
+            if self.engine_cfg.max_candles is not None and idx >= self.engine_cfg.max_candles:
+                self.log.info(
+                    "Stopping early due to max_candles=%d", self.engine_cfg.max_candles
+                )
+                break
+
             # Strategy decides on new orders based on the latest candle + account state
             new_orders = self.strategy.on_candle(candle, self.account) or []
 
@@ -148,63 +137,101 @@ class BacktestEngine:
 
             # Apply fills to positions & account state and notify strategy
             for event in filled_events:
+                fee = event.price * event.qty * self.engine_cfg.trading_fee_pct
+
                 self.log.info(
-                    "Order fill: order_id=%s side=%s price=%.6f qty=%.4f ts=%s",
+                    "Order fill: order_id=%s side=%s price=%.6f qty=%.4f ts=%s fee=%.6f",
                     event.order_id,
                     event.side.value,
                     event.price,
                     event.qty,
                     event.filled_at,
+                    fee,
                 )
-                self._apply_fill(event)
+
+                # Update positions & account (pass fee explicitly)
+                self._apply_fill(event, fee)
+
+                # Feed TradeBuilder so we get closed trades (pass same fee)
+                self._trade_builder.on_fill(event, fee)
+
+                # Strategy callback
                 self.strategy.on_order_filled(event)
 
             # Recompute equity based on open positions at candle close
             self._update_equity(candle)
 
-        # After loop: compute simple stats & log summary
-        stats = self._compute_simple_stats()
-        self.log.info("=== Backtest completed for symbol=%s ===", self.config.symbol)
-        self.log.info(
-            "Final total_value=%.2f (start=%.2f) -> total_return=%.2f%%, max_drawdown=%.2f%%, trades=%d, win_rate=%.2f%%",
-            stats["final_value"],
-            stats["start_value"],
-            stats["total_return_pct"],
-            stats["max_drawdown_pct"],
-            stats["num_trades"],
-            stats["win_rate_pct"],
+        # ---- After loop: build BacktestResult and compute metrics ----
+
+        final_equity = (
+            self._equity_curve[-1].equity if self._equity_curve else self.account.total_value
         )
 
-        return BacktestResult(
-            trades=self._trade_records,
+        result = BacktestResult(
+            run_id=str(uuid4()),
+            run_name=f"{self.data_cfg.symbol}_backtest",
+            symbol=self.data_cfg.symbol,
+            timeframe=getattr(self.data_cfg, "timeframe", "unknown"),
+
+            started_at=started_at,
+            finished_at=datetime.now(),
+
+            # must match dataclass + tests
+            initial_balance=self.engine_cfg.initial_balance,
+            final_equity=final_equity,
+
+            trades=self._trade_builder.get_trades(),
             equity_curve=self._equity_curve,
-            positions=list(self._open_positions.values()),
-            raw_orders=self._all_orders,
         )
+
+        # Keep positions & raw orders in extra so they’re still accessible
+        result.extra["positions"] = list(self._open_positions.values())
+        result.extra["raw_orders"] = self._all_orders
+
+        # Compute metrics via registry
+        metric_names = self.engine_cfg.metrics or None  # None = all registered
+        result.metrics = self.metric_registry.compute_all(result, metric_names)
+
+        # Log summary using metrics
+        self.log.info("=== Backtest completed for symbol=%s ===", self.data_cfg.symbol)
+        self.log.info(
+            "Final total_value=%.2f (start=%.2f) -> total_return=%.2f%%, max_drawdown=%.2f%%, trades=%d, win_rate=%.2f%%",
+            result.final_equity,
+            result.initial_balance,  # <- fixed name
+            result.metrics.get("total_return_pct", 0.0),
+            result.metrics.get("max_drawdown_pct", 0.0),
+            int(result.metrics.get("n_trades", 0.0)),
+            result.metrics.get("win_rate_pct", 0.0),
+        )
+
+
+        return result
 
     # ----------------------------------------------------------------
     # Data loading
     # ----------------------------------------------------------------
     def _load_raw_data(self) -> pd.DataFrame:
         cfg = DatasetConfig(
-            symbol=self.config.symbol,
-            start=self.config.start,
-            end=self.config.end,
+            symbol=self.data_cfg.symbol,
+            start=self.data_cfg.start,
+            end=self.data_cfg.end,
+            timeframe=getattr(self.data_cfg, "timeframe", "1m"),
         )
         df = self.data_source.load(cfg)
 
         required_cols = {"Open", "High", "Low", "Close", "Volume"}
         missing = required_cols - set(df.columns)
         if missing:
-            raise ValueError(f"Data for {self.config.symbol} is missing columns: {missing}")
+            raise ValueError(f"Data for {self.data_cfg.symbol} is missing columns: {missing}")
 
         # Log some basic info about the loaded data
         first_ts = df.index[0]
         last_ts = df.index[-1]
         n_rows = len(df)
         self.log.info(
-            "Data loaded for %s: %d rows from %s to %s",
-            self.config.symbol,
+            "Data loaded for %s (timeframe=%s): %d rows from %s to %s",
+            self.data_cfg.symbol,
+            getattr(self.data_cfg, "timeframe", "unknown"),
             n_rows,
             first_ts,
             last_ts,
@@ -212,23 +239,42 @@ class BacktestEngine:
 
         if n_rows >= 2:
             approx_delta = df.index[1] - df.index[0]
-            self.log.info("Approximate candle interval for %s: %s", self.config.symbol, approx_delta)
+            self.log.info(
+                "Approximate candle interval for %s: %s",
+                self.data_cfg.symbol,
+                approx_delta,
+            )
 
         return df
 
+
     def _to_candles(self, df: pd.DataFrame) -> List[Candle]:
+        """
+        Convert OHLCV DataFrame (with datetime index and columns
+        ['Open', 'High', 'Low', 'Close', 'Volume']) to a list of Candle objects.
+
+        Faster than iterrows() because it uses itertuples().
+        Assumes the index is the candle timestamp.
+        """
         candles: List[Candle] = []
-        for ts, row in df.iterrows():
-            candles.append(
+        append = candles.append
+
+        # This yields tuples in the form:
+        # (index, Open, High, Low, Close, Volume)
+        for ts, open_, high_, low_, close_, volume in df.itertuples(
+            index=True, name=None
+        ):
+            append(
                 Candle(
-                    timestamp=ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts,
-                    open=float(row["Open"]),
-                    high=float(row["High"]),
-                    low=float(row["Low"]),
-                    close=float(row["Close"]),
-                    volume=float(row["Volume"]),
+                    timestamp=ts,   # same as before: index used as timestamp
+                    open=open_,
+                    high=high_,
+                    low=low_,
+                    close=close_,
+                    volume=volume,
                 )
             )
+
         return candles
 
     # ----------------------------------------------------------------
@@ -272,7 +318,7 @@ class BacktestEngine:
                     price=fill_price,
                     qty=order.qty,
                     filled_at=candle.timestamp,
-                    position_id=None,  # set in _apply_fill
+                    position_id=None,  # set in _apply_fill if you want
                 )
                 filled.append(fill)
             else:
@@ -284,15 +330,13 @@ class BacktestEngine:
     # ----------------------------------------------------------------
     # Position/account updates
     # ----------------------------------------------------------------
-    def _apply_fill(self, event: OrderFilledEvent) -> None:
+    def _apply_fill(self, event: OrderFilledEvent, fee: float) -> None:
         """
         Update positions & account state given a single fill event.
         For MVP:
           - BUY opens a new LONG position (one per fill).
           - SELL closes the oldest still-open LONG position (FIFO) of same symbol.
         """
-        fee = event.price * event.qty * self.config.trading_fee_pct
-
         if event.side == Side.BUY:
             # Create a new LONG position
             pos_id = str(uuid4())
@@ -350,24 +394,9 @@ class BacktestEngine:
             pos.closed_at = event.filled_at
             pos.realized_pnl = gross_pnl - total_fee
 
-            # Credit cash minus fee
+            # Credit cash minus this side's fee
             old_cash = self.account.cash_balance
             self.account.cash_balance += notional - fee
-
-            self._trade_records.append(
-                TradeRecord(
-                    position_id=pos.id,
-                    symbol=pos.symbol,
-                    side=pos.side,
-                    size=pos.size,
-                    entry_price=pos.entry_price,
-                    exit_price=event.price,
-                    entry_time=pos.opened_at,
-                    exit_time=pos.closed_at,
-                    realized_pnl=pos.realized_pnl,
-                    total_fees=total_fee,
-                )
-            )
 
             self.log.info(
                 "SELL fill -> closed position %s: size=%.4f entry=%.6f exit=%.6f gross_pnl=%.6f total_fee=%.6f realized_pnl=%.6f; cash %.2f -> %.2f",
@@ -429,7 +458,7 @@ class BacktestEngine:
         for pos in self._open_positions.values():
             if not pos.is_open:
                 continue
-            if pos.symbol != self.config.symbol:
+            if pos.symbol != self.data_cfg.symbol:
                 continue  # single-symbol engine for now
 
             if pos.side == PositionSide.LONG:
@@ -442,7 +471,9 @@ class BacktestEngine:
         self.account.invested_cost = invested_cost
         self.account.total_value = self.account.cash_balance + market_value
 
-        self._equity_curve.append((candle.timestamp, self.account.total_value))
+        self._equity_curve.append(
+            EquityPoint(timestamp=candle.timestamp, equity=self.account.total_value)
+        )
 
         self.log.debug(
             "Equity update @ %s -> cash=%.2f, invested_cost=%.2f, market_value=%.2f, total_value=%.2f",
@@ -452,47 +483,3 @@ class BacktestEngine:
             market_value,
             self.account.total_value,
         )
-
-    # ----------------------------------------------------------------
-    # Simple stats / summary
-    # ----------------------------------------------------------------
-    def _compute_simple_stats(self) -> Dict[str, float]:
-        if not self._equity_curve:
-            return {
-                "start_value": self.config.initial_balance,
-                "final_value": self.account.total_value,
-                "total_return_pct": 0.0,
-                "max_drawdown_pct": 0.0,
-                "num_trades": len(self._trade_records),
-                "win_rate_pct": 0.0,
-            }
-
-        values = [v for _, v in self._equity_curve]
-        start_value = values[0]
-        final_value = values[-1]
-        total_return_pct = (final_value / start_value - 1.0) * 100.0
-
-        # Max drawdown
-        peak = values[0]
-        max_dd = 0.0
-        for v in values:
-            if v > peak:
-                peak = v
-            dd = v / peak - 1.0
-            if dd < max_dd:
-                max_dd = dd
-        max_drawdown_pct = max_dd * 100.0
-
-        # Win-rate
-        num_trades = len(self._trade_records)
-        wins = sum(1 for tr in self._trade_records if tr.realized_pnl > 0)
-        win_rate_pct = (wins / num_trades * 100.0) if num_trades > 0 else 0.0
-
-        return {
-            "start_value": start_value,
-            "final_value": final_value,
-            "total_return_pct": total_return_pct,
-            "max_drawdown_pct": max_drawdown_pct,
-            "num_trades": num_trades,
-            "win_rate_pct": win_rate_pct,
-        }

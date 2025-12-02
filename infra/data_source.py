@@ -31,10 +31,15 @@ class DatasetConfig:
     end : Optional[str]
         Inclusive end datetime.
         If None, the latest available candle is used.
+    timeframe : str
+        Target timeframe string, e.g. "1m", "5m", "15m", "1h", "4h", "1d".
+        The loader assumes the *raw* data is at 1m resolution and will
+        resample down to the requested timeframe.
     """
     symbol: str
     start: Optional[str] = None
     end: Optional[str] = None
+    timeframe: str = "1m"
 
 
 class LocalFileDataSource:
@@ -96,15 +101,17 @@ class LocalFileDataSource:
     # ------------------------------------------------------------------
     def load(self, cfg: DatasetConfig) -> pd.DataFrame:
         """
-        Load data for the given DatasetConfig and return a sliced DataFrame.
+        Load data for the given DatasetConfig and return a sliced (and optionally
+        resampled) DataFrame.
         """
         data_path = self.find_file_for_symbol(cfg.symbol)
         self.log.info(
-            "Loading data for symbol=%s from %s (requested: start=%s, end=%s)",
+            "Loading data for symbol=%s from %s (requested: start=%s, end=%s, timeframe=%s)",
             cfg.symbol,
             data_path,
             cfg.start,
             cfg.end,
+            cfg.timeframe,
         )
 
         # Determine file type by suffixes (.parquet.gzip vs .csv)
@@ -151,18 +158,126 @@ class LocalFileDataSource:
             self.log.error(msg)
             raise ValueError(msg)
 
+        timeframe = getattr(cfg, "timeframe", "1m") or "1m"
+        if timeframe != "1m":
+            final_df = self._resample_timeframe(sliced, timeframe)
+        else:
+            final_df = sliced
+
         self.log.info(
-            "Loaded %d rows for %s. Available range=%s → %s. Returned slice=%s → %s (%d rows).",
+            "Loaded %d raw rows for %s (%s → %s). Returned %d rows after "
+            "slicing/resampling to timeframe=%s (%s → %s).",
             len(df),
             cfg.symbol,
             df.index[0],
             df.index[-1],
-            sliced.index[0],
-            sliced.index[-1],
-            len(sliced),
+            len(final_df),
+            timeframe,
+            final_df.index[0],
+            final_df.index[-1],
         )
 
-        return sliced
+        return final_df
+
+    # ------------------------------------------------------------------
+    # Resampling helpers
+    # ------------------------------------------------------------------
+    def _timeframe_to_pandas_rule(self, timeframe: str) -> str:
+        """
+        Convert a human-friendly timeframe string like '1m', '5m', '1h', '4h', '1d'
+        into a pandas resample rule ('1T', '5T', '1H', '4H', '1D').
+        """
+        tf = timeframe.strip()
+        if not tf:
+            raise ValueError("Timeframe string must not be empty.")
+
+        unit = tf[-1].lower()
+        try:
+            value = int(tf[:-1])
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid timeframe '{timeframe}'. Expected formats like '1m', '5m', '1h', '1d'."
+            ) from exc
+
+        if unit == "m":
+            return f"{value}T"  # minutes
+        if unit == "h":
+            return f"{value}H"  # hours
+        if unit == "d":
+            return f"{value}D"  # days
+
+        raise ValueError(
+            f"Unsupported timeframe '{timeframe}'. Use 'Xm', 'Xh' or 'Xd', e.g. '5m', '1h', '1d'."
+        )
+
+    def _resample_timeframe(self, df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+        """
+        Downsample from 1m candles to a higher timeframe.
+
+        Aggregation:
+          - Open  = first
+          - High  = max
+          - Low   = min
+          - Close = last
+          - Volume = sum
+        """
+        rule = self._timeframe_to_pandas_rule(timeframe)
+
+        ohlc = df[["Open", "High", "Low", "Close"]].resample(rule).agg(
+            {
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+            }
+        )
+        vol = df["Volume"].resample(rule).sum()
+
+        out = ohlc.copy()
+        out["Volume"] = vol
+
+        # Drop empty bins (no candles in that interval)
+        out.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
+
+        if out.empty:
+            raise ValueError(
+                f"Resampling to timeframe '{timeframe}' produced an empty DataFrame."
+            )
+
+        self.log.info(
+            "Resampled data to timeframe=%s: %d → %d rows.",
+            timeframe,
+            len(df),
+            len(out),
+        )
+        return out
+
+
+
+class InMemoryDataSource:
+    """
+    Simple data source that always returns the same pre-loaded DataFrame.
+
+    Useful for research/parameter-search runs to avoid re-reading and
+    resampling the same data from disk on every engine run.
+    """
+
+    def __init__(self, df: pd.DataFrame) -> None:
+        if df.empty:
+            raise ValueError("InMemoryDataSource received an empty DataFrame.")
+        self.df = df
+        self.log = get_logger("data.memory")
+
+    def load(self, cfg: DatasetConfig) -> pd.DataFrame:
+        self.log.info(
+            "Using in-memory DataFrame for symbol=%s timeframe=%s (%d rows).",
+            cfg.symbol,
+            cfg.timeframe,
+            len(self.df),
+        )
+        # We assume df is already sliced & resampled for this timeframe.
+        return self.df
+
 
 
 # ----------------------------------------------------------------------
@@ -194,12 +309,14 @@ def load_data(dataset_conf: DatasetConfig) -> pd.DataFrame:
             symbol=getattr(dataset_conf, "symbol"),
             start=getattr(dataset_conf, "start", None),
             end=getattr(dataset_conf, "end", None),
+            timeframe=getattr(dataset_conf, "timeframe", "1m"),
         )
     else:
         cfg = DatasetConfig(
             symbol=getattr(dataset_conf, "symbol"),
             start=getattr(dataset_conf, "start_date", None),
             end=getattr(dataset_conf, "end_date", None),
+            timeframe=getattr(dataset_conf, "timeframe", "1m"),
         )
 
     ds = LocalFileDataSource()
@@ -215,8 +332,9 @@ if __name__ == "__main__":
         symbol="XRPUSDT",
         start="2021-11-1",
         end="2025-11-20",
+        timeframe="1m",
     )
     df = ds.load(cfg)
 
     print(df.head())
-    print(len(df))  # should be close to 1T (1 minute) or None but spaced by 1 min
+    print(len(df))  # number of candles at requested timeframe

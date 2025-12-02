@@ -48,7 +48,8 @@ desktop.ini
 # Logs / results / temp
 # -------------------------
 logs/
-results/
+resultings/
+output/
 *.log
 
 # -------------------------
@@ -65,3 +66,4 @@ data/
 *.tmp
 *.bak
 *.orig
+project_snapshot.txt

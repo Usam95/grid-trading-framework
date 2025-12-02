@@ -1,0 +1,92 @@
+name: "xrp_grid_1m_research"
+description: "Static grid on XRPUSDT with optional parameter search."
+
+mode: backtest
+
+data:
+  source: local
+  symbol: "XRPUSDT"
+
+  # Target timeframe for this run (raw data is 1m)
+  timeframe: "1m"
+
+  # Adjust these according to your downloaded data range
+  start: "2021-11-01T00:00:00"
+  end:   "2025-11-20T23:59:00"
+  root: "historical_data"
+
+  # Optional: timeframes that a research/param-search runner could iterate over
+  research_timeframes:
+    - "1m"
+    - "5m"
+    - "15m"
+
+  # New: integrated split config (DataSplitConfig)
+  split:
+    mode: ratio          # or "date"
+    train_ratio: 0.8     # 80% train/backtest, 20% forward
+    # If you want to split by date instead:
+    # mode: date
+    # split_date: "2025-01-01T00:00:00"
+
+engine:
+  mode: backtest
+  initial_balance: 1000.0
+  trading_fee_pct: 0.0007     # 0.07% per fill
+  slippage_pct: 0.0
+  max_candles: null           # or e.g. 10000
+
+  # Optional: override metrics if you like; these are the defaults
+  metrics:
+    - net_pnl
+    - total_return_pct
+    - max_drawdown_pct
+    - win_rate_pct
+    - profit_factor
+
+strategy:
+  kind: "grid.simple"
+  symbol: "XRPUSDT"
+  base_order_size: 10.0      # used for a normal single backtest run
+  n_levels: 10
+
+  # Percent-based range around the first candle close
+  range_mode: "percent"      # case-insensitive -> GridRangeMode.PERCENT
+  spacing: "arithmetic"      # case-insensitive -> GridSpacing.ARITHMETIC
+
+  lower_pct: 0.10            # 10% below
+  upper_pct: 0.10            # 10% above
+
+  # absolute range not used in PERCENT mode
+  lower_price: null
+  upper_price: null
+
+logging:
+  name: "gridbt"
+  level: "INFO"
+  log_dir: "logs"
+  to_console: true
+  to_file: true
+
+# Optional block: only used by a research / param-search runner.
+# The simple backtest app can ignore this completely.
+research:
+  enabled: true          # set to false or remove block to disable research
+  max_runs: 100          # optional cap; null/omitted = run all combinations
+
+  param_grid:
+    # lists of candidate values → Cartesian product
+    base_order_size: [5.0, 10.0, 20.0]
+    n_levels: [10, 20, 30]
+
+    # percent-based ranges
+    lower_pct: [0.05, 0.10]
+    upper_pct: [0.05, 0.10]
+
+    # absolute ranges (empty = not used)
+    lower_price: []
+    upper_price: []
+
+    # enums are case-insensitive because of validators
+    range_mode: ["percent"]          # values: ["percent", "absolute"]
+    spacing: ["arithmetic"]          # values: ["arithmetic", "geometric"]

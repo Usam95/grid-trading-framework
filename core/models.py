@@ -46,6 +46,7 @@ class Candle:
     close: float
     volume: float
 
+    extra: dict[str, float] = field(default_factory=dict)  # e.g. {"ATR": 0.0123, "RSI_14": 55.0}
 
 # ---------------------------------------------------------------------------
 # Order – representation of an order in our domain
@@ -102,20 +103,29 @@ class Position:
 # ---------------------------------------------------------------------------
 # AccountState – snapshot of account-level balances
 # ---------------------------------------------------------------------------
-
 @dataclass
 class AccountState:
     """
     Minimal account snapshot used by risk management and backtests.
-    All values are assumed to be in the quote currency (e.g. USDT or EUR).
+    All values are in quote currency (e.g. USDT or EUR).
     """
-    cash_balance: float       # was: balance
-    total_value: float        # was: equity
-    invested_cost: float      # was: margin_used
+    cash_balance: float        # real cash in wallet
+    total_value: float         # cash + market value of all positions
+    invested_cost: float       # total cost basis of open positions
 
     @property
-    def available_cash(self) -> float:    # was: free_margin
+    def available_cash(self) -> float:
+        """How much I can actually spend right now in spot."""
+        return self.cash_balance
+
+    @property
+    def free_equity(self) -> float:
+        """
+        Equity not tied up as cost in open positions.
+        Useful if you *later* want a margin-like or risk-based view.
+        """
         return self.total_value - self.invested_cost
+
 
 
 # ---------------------------------------------------------------------------

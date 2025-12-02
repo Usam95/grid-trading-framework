@@ -1,41 +1,37 @@
 # tests/test_backtest_engine.py
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime
 
 import pandas as pd
 import pytest
 
-from core.models import (
-    Candle,
-    Side,
-    OrderType,
-    Order,
-    AccountState,
-)
-from backtest.engine import (
-    BacktestEngine,
-    BacktestConfig,
-    BacktestResult,
-)
+from core.models import Candle, Side, OrderType, Order, AccountState
 from core.strategy.base import IStrategy
+
+from backtest.engine import BacktestEngine
+from infra.config_models import BacktestEngineConfig, LocalDataConfig
 
 
 # ---------------------------------------------------------------------------
 # Helpers / Test Doubles
 # ---------------------------------------------------------------------------
 
+
 class FakeDataSource:
     """
-    Minimal stub that mimics LocalFileDataSource.load().
+    Minimal stub that mimics LocalFileDataSource.load(cfg).
+
+    It ignores the config and always returns the injected DataFrame.
     """
 
     def __init__(self, df: pd.DataFrame):
         self._df = df
+        self.last_cfg = None  # for assertions if needed
 
     def load(self, cfg) -> pd.DataFrame:
-        # ignore cfg.start/cfg.end for simplicity — df is already in desired range
+        # cfg in real code is DatasetConfig, coming from LocalDataConfig
+        self.last_cfg = cfg
         return self._df
 
 
@@ -51,7 +47,7 @@ class OneShotBuyStrategy(IStrategy):
     def __init__(self, symbol: str):
         self.symbol = symbol
         self._first_call_done = False
-        self.fills: list = []
+        self.fills = []
 
     def on_candle(self, candle: Candle, account: AccountState):
         if self._first_call_done:
@@ -63,13 +59,14 @@ class OneShotBuyStrategy(IStrategy):
             id="test-order-1",
             symbol=self.symbol,
             side=Side.BUY,
-            price=candle.close,  # equal to close so it's fillable in simple fill model
+            price=candle.close,  # equal to close so it's fillable in our simple fill model
             qty=1.0,
             type=OrderType.LIMIT,
         )
         return [order]
 
-    def on_order_filled(self, event):
+    def on_order_filled(self, event, *_, **__):
+        # The engine must call this when orders are filled
         self.fills.append(event)
 
 
@@ -96,83 +93,92 @@ def make_test_dataframe(n: int = 5, start_price: float = 10.0) -> pd.DataFrame:
 # Tests
 # ---------------------------------------------------------------------------
 
-def test_to_candles_converts_dataframe_correctly():
-    df = make_test_dataframe(n=3, start_price=10.0)
+
+def _make_engine_with_df(df: pd.DataFrame) -> tuple[BacktestEngine, OneShotBuyStrategy]:
+    """
+    Small helper to build a BacktestEngine wired to FakeDataSource and OneShotBuyStrategy.
+    """
     ds = FakeDataSource(df)
-    cfg = BacktestConfig(
-        symbol="XRPUSDT",
-        start=df.index[0].isoformat(),
-        end=df.index[-1].isoformat(),
+    engine_cfg = BacktestEngineConfig(
         initial_balance=1000.0,
         trading_fee_pct=0.0,
+        slippage_pct=0.0,
+    )
+    data_cfg = LocalDataConfig(
+        symbol="XRPUSDT",
+        start=None,
+        end=None,
     )
     strat = OneShotBuyStrategy(symbol="XRPUSDT")
-    engine = BacktestEngine(config=cfg, data_source=ds, strategy=strat)
 
-    candles = engine._to_candles(df)
+    engine = BacktestEngine(
+        engine_cfg=engine_cfg,
+        data_cfg=data_cfg,
+        strategy=strat,
+        data_source=ds,
+    )
+    return engine, strat
+
+
+def test_to_candles_converts_dataframe_correctly():
+    """
+    BacktestEngine._to_candles should map OHLCV DataFrame → list[Candle].
+    """
+    df = make_test_dataframe(n=3, start_price=10.0)
+    engine, _ = _make_engine_with_df(df)
+
+    # private helper but fine for tests
+    candles = engine._to_candles(df)  # type: ignore[attr-defined]
 
     assert len(candles) == len(df)
     assert isinstance(candles[0], Candle)
-    assert candles[0].timestamp == df.index[0]
+    # Timestamp mapping
+    assert candles[0].timestamp == df.index[0].to_pydatetime()
+    # OHLCV mapping
     assert candles[0].open == df["Open"].iloc[0]
+    assert candles[0].high == df["High"].iloc[0]
+    assert candles[0].low == df["Low"].iloc[0]
     assert candles[0].close == df["Close"].iloc[0]
     assert candles[0].volume == df["Volume"].iloc[0]
 
 
-def test_engine_run_produces_backtest_result_and_equity_curve():
-    df = make_test_dataframe(n=10, start_price=10.0)
-    ds = FakeDataSource(df)
-    cfg = BacktestConfig(
-        symbol="XRPUSDT",
-        start=df.index[0].isoformat(),
-        end=df.index[-1].isoformat(),
-        initial_balance=1000.0,
-        trading_fee_pct=0.0,
-    )
-    strat = OneShotBuyStrategy(symbol="XRPUSDT")
-    engine = BacktestEngine(config=cfg, data_source=ds, strategy=strat)
+def test_engine_runs_and_executes_oneshot_buy_strategy():
+    """
+    Smoke test:
+
+    - Engine runs over a small DataFrame
+    - Strategy is called
+    - One LIMIT BUY is placed and filled
+    - Account cash balance is reduced by notional
+    - Strategy.on_order_filled is called.
+    """
+    df = make_test_dataframe(n=5, start_price=10.0)
+    engine, strat = _make_engine_with_df(df)
 
     result = engine.run()
 
-    # --- basic structure checks ---
-    assert isinstance(result, BacktestResult)
-    assert len(result.equity_curve) == len(df)
+    # Strategy should have recorded exactly one fill
+    assert len(strat.fills) == 1
+    fill = strat.fills[0]
+    assert fill.symbol == "XRPUSDT"
+    assert fill.side == Side.BUY
+    # Filled at candle.close of the first bar (10.0)
+    assert fill.price == pytest.approx(10.0)
 
-    # At least one equity point should differ from initial balance
-    initial_balance = cfg.initial_balance
-    equity_values = [eq for (_, eq) in result.equity_curve]
-    assert any(abs(eq - initial_balance) > 1e-9 for eq in equity_values)
+    # After one BUY of qty=1 at 10.0 and zero fees:
+    #  - invested_cost should be 10.0
+    #  - cash should be 990.0
+    assert engine.account.cash_balance == pytest.approx(1000.0 - 10.0)
+    assert engine.account.invested_cost == pytest.approx(10.0)
 
-    # Strategy should have received at least one fill
-    assert len(strat.fills) >= 1
+    # Equity should be cash + market value of open position at last candle close
+    last_close = df["Close"].iloc[-1]
+    expected_market_value = last_close * 1.0
+    expected_total = engine.account.cash_balance + expected_market_value
+    assert engine.account.total_value == pytest.approx(expected_total)
 
-
-def test_engine_respects_initial_balance():
-    """
-    Engine should start from initial_balance, then apply trades.
-
-    For OneShotBuyStrategy:
-      - first candle: buy 1 unit at first close
-      - equity after first candle = initial_balance - close[0]
-    """
-    df = make_test_dataframe(n=3, start_price=10.0)
-    ds = FakeDataSource(df)
-    initial_balance = 500.0
-    cfg = BacktestConfig(
-        symbol="XRPUSDT",
-        start=df.index[0].isoformat(),
-        end=df.index[-1].isoformat(),
-        initial_balance=initial_balance,
-        trading_fee_pct=0.0,
-    )
-    strat = OneShotBuyStrategy(symbol="XRPUSDT")
-    engine = BacktestEngine(config=cfg, data_source=ds, strategy=strat)
-
-    result = engine.run()
-
-    first_ts, first_equity = result.equity_curve[0]
-
-    first_close = df["Close"].iloc[0]
-    expected_first_equity = initial_balance - first_close  # 500 - 10 = 490 in current setup
-
-    assert pytest.approx(first_equity, rel=1e-9) == expected_first_equity
+    # BacktestResult basic sanity checks
+    assert result.initial_equity == pytest.approx(1000.0)
+    assert result.final_equity == pytest.approx(engine.account.total_value)
+    # We should have at least one equity point
+    assert len(result.equity_curve) > 0

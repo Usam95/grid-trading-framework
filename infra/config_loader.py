@@ -7,7 +7,7 @@ from typing import Union
 
 from pydantic import ValidationError
 
-from infra.config_models import RunConfig
+from infra.config import RunConfig
 
 try:
     import yaml  # type: ignore
@@ -40,7 +40,7 @@ def load_run_config(path: Union[str, Path]) -> RunConfig:
     Load a RunConfig from the given YAML/JSON file.
 
     Example:
-        cfg = load_run_config('configs/backtests/xrp_grid_1m.yaml')
+        cfg = load_run_config('config/grid_run.yml')
     """
     p = Path(path)
     if not p.is_file():

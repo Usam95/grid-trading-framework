@@ -1,14 +1,20 @@
 # app/simple_grid_backtest.py
 from __future__ import annotations
 
+import time  # ⬅️ NEW
+
 from infra.data_source import LocalFileDataSource
 from infra.config_loader import load_run_config
-from infra.config_models import RunConfig, GridStrategyConfig, LocalDataConfig
+from infra.config import RunConfig, GridStrategyConfig, LocalDataConfig
 from infra.logging_setup import get_logger, init_logging
-
-from backtest.config import BacktestConfig
+from pathlib import Path
 from backtest.engine import BacktestEngine
 from core.strategy.grid_strategy_simple import GridConfig, SimpleGridStrategy
+
+# NEW: metrics + result saving/summary
+from core.results.metrics import create_default_metric_registry
+from core.results.repository import save_backtest_result
+from core.results.summary import print_result_summary
 
 
 def main(config_path: str = "configs/backtests/xrp_grid_1m.yaml") -> None:
@@ -81,40 +87,65 @@ def main(config_path: str = "configs/backtests/xrp_grid_1m.yaml") -> None:
     )
 
     # ------------------------------------------------------------------
-    # 4) Build low-level BacktestConfig for the engine
+    # 4) Log engine config (BacktestEngineConfig)
     # ------------------------------------------------------------------
-    bt_cfg = BacktestConfig(
-        symbol=run_cfg.data.symbol,
-        start=run_cfg.data.start.isoformat() if run_cfg.data.start else None,
-        end=run_cfg.data.end.isoformat() if run_cfg.data.end else None,
-        initial_balance=run_cfg.engine.initial_balance,
-        trading_fee_pct=run_cfg.engine.trading_fee_pct,
-    )
-
     logger.info(
-        "Engine: mode=%s | initial_balance=%.2f | trading_fee_pct=%.6f | slippage_pct=%.6f",
+        "Engine: mode=%s | initial_balance=%.2f | trading_fee_pct=%.6f | slippage_pct=%.6f | max_candles=%s",
         run_cfg.engine.mode.value,
         run_cfg.engine.initial_balance,
         run_cfg.engine.trading_fee_pct,
         run_cfg.engine.slippage_pct,
+        str(run_cfg.engine.max_candles),
+    )
+    logger.info("Engine metrics: %s", run_cfg.engine.metrics)
+
+    # ------------------------------------------------------------------
+    # 5) Build metric registry and engine
+    # ------------------------------------------------------------------
+    metric_registry = create_default_metric_registry()
+
+    engine = BacktestEngine(
+        engine_cfg=run_cfg.engine,
+        data_cfg=run_cfg.data,
+        strategy=strategy,
+        data_source=ds,
+        metric_registry=metric_registry,
     )
 
     # ------------------------------------------------------------------
-    # 5) Run backtest
+    # 6) Run backtest (measure execution time)
     # ------------------------------------------------------------------
-    engine = BacktestEngine(config=bt_cfg, data_source=ds, strategy=strategy)
+    t_start = time.perf_counter()
     result = engine.run()
+    t_end = time.perf_counter()
+    elapsed_sec = t_end - t_start
+    elapsed_min = elapsed_sec / 60.0
 
-    logger.info("Backtest finished. Trades: %d", len(result.trades))
-    if result.equity_curve:
-        final_ts, final_equity = result.equity_curve[-1]
-        logger.info("Final equity at %s: %.2f", final_ts, final_equity)
-        print(f"Final equity: {final_equity:.2f}")
-    else:
-        logger.warning("No equity curve points produced.")
+    logger.info(
+        "Backtest execution time: %.2f seconds (%.2f minutes)",
+        elapsed_sec,
+        elapsed_min,
+    )
 
-    print(f"Num trades: {len(result.trades)}")
+    # ------------------------------------------------------------------
+    # 7) Save results & print summary
+    # ------------------------------------------------------------------
+    symbol = run_cfg.data.symbol  # LocalDataConfig
+    run_dir = save_backtest_result(
+        result,
+        base_dir=Path("output") / symbol / "manual_runs",
+    )
 
-#& "C:\ProgramData\Anaconda3\Scripts\conda.exe" run -n backtester python -m app.simple_grid_backtest
+    logger.info("Results saved to %s", run_dir)
+
+    # Nice human-readable summary (goes into logs)
+    print_result_summary(result, logger)
+
+    # Optional: also print a quick console line
+    print(f"Final equity:   {result.final_equity:.2f}")
+    print(f"Num trades:     {len(result.trades)}")
+    print(f"Run time:       {elapsed_sec:.2f} s ({elapsed_min:.2f} min)")
+
+
 if __name__ == "__main__":
     main()
