@@ -1,3 +1,4 @@
+#backtester\infra\config\strategy_base.py
 from __future__ import annotations
 
 from pydantic import BaseModel

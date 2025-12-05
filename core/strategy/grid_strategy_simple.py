@@ -1,4 +1,3 @@
-# core/strategy/grid_strategy_simple.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -54,15 +53,22 @@ class GridLevel:
 
 class SimpleGridStrategy(BaseStrategy):
     """
-    Very simple static grid for MVP backtesting.
+    Binance-style neighbor grid (fixed band, no trailing / floating yet).
 
     Behaviour:
       - On first candle:
-          * Builds N grid levels within configured price range.
-          * Levels below close -> BUY limit orders.
-          * Levels at/above close -> SELL limit orders.
-      - After that:
-          * Does not create new orders when levels are filled (no re-placement yet).
+          * Compute price range [lower, upper] from config.
+          * Build N grid price levels between lower and upper.
+          * Seed initial orders like Binance:
+              - Let prices = p0 < p1 < ... < pn.
+              - Find k = max i where p[i] < start_price.
+              - Place BUY at p[0..k].
+              - Skip p[k+1].
+              - Place SELL at p[k+2..n].
+      - On fill:
+          * BUY filled at p[i]  -> place SELL at p[i+1] (if exists and inactive).
+          * SELL filled at p[i] -> place BUY  at p[i-1] (if exists and inactive).
+      - Orders created after fills are emitted on the next candle via _pending_orders.
     """
 
     def __init__(self, config: GridConfig) -> None:
@@ -71,6 +77,15 @@ class SimpleGridStrategy(BaseStrategy):
         self._grid_levels: List[GridLevel] = []
         self._order_to_level: Dict[str, GridLevel] = {}
         self.log = get_logger("strategy.grid")
+
+        # Grid spacing / band info
+        self._step: Optional[float] = None   # for ARITHMETIC
+        self._ratio: Optional[float] = None  # for GEOMETRIC
+        self._lower: Optional[float] = None
+        self._upper: Optional[float] = None
+
+        # Orders created in on_order_filled and emitted on next candle
+        self._pending_orders: List[Order] = []
 
     # ------------------------------------------------------------
     # Strategy interface
@@ -81,8 +96,9 @@ class SimpleGridStrategy(BaseStrategy):
                 raise ValueError("GridConfig.n_levels must be >= 2")
 
             self.log.info(
-                "Initializing SimpleGridStrategy for %s at first candle: ts=%s close=%.6f "
-                "(n_levels=%d, lower_pct=%s, upper_pct=%s, lower_price=%s, upper_price=%s, spacing=%s, range_mode=%s, base_order_size=%.4f)",
+                "Initializing Binance-style GridStrategy for %s at first candle: "
+                "ts=%s close=%.6f (n_levels=%d, lower_pct=%s, upper_pct=%s, "
+                "lower_price=%s, upper_price=%s, spacing=%s, range_mode=%s, base_order_size=%.4f)",
                 self.config.symbol,
                 candle.timestamp,
                 candle.close,
@@ -97,7 +113,7 @@ class SimpleGridStrategy(BaseStrategy):
             )
 
             self._build_initial_grid(candle.close)
-            orders = self._create_orders_for_active_levels()
+            orders = self._seed_initial_orders(candle.close)
 
             for o in orders:
                 self.log.info(
@@ -111,36 +127,55 @@ class SimpleGridStrategy(BaseStrategy):
             self._initialized = True
             return orders
 
-        # For MVP: no new orders after initialization
+        # After initialization: emit any pending neighbor orders
+        if self._pending_orders:
+            orders = self._pending_orders
+            self._pending_orders = []
+            self.log.debug(
+                "Emitting %d pending neighbor-orders at ts=%s close=%.6f",
+                len(orders),
+                candle.timestamp,
+                candle.close,
+            )
+            return orders
+
         self.log.debug(
-            "No new grid orders on candle ts=%s close=%.6f (static grid).",
+            "No new grid orders on candle ts=%s close=%.6f.",
             candle.timestamp,
             candle.close,
         )
         return []
 
     def on_order_filled(self, event: OrderFilledEvent) -> None:
-        # Mark the corresponding grid level as inactive
+        # Find the corresponding grid level
         level = self._order_to_level.get(event.order_id)
-        if level is not None:
-            level.active = False
-            self.log.info(
-                "Grid level deactivated due to fill: order_id=%s side=%s price=%.6f qty=%.4f",
-                event.order_id,
-                event.side.value,
-                event.price,
-                event.qty,
-            )
-        else:
+        if level is None:
             self.log.debug(
                 "Received OrderFilledEvent for unknown order_id=%s in SimpleGridStrategy.",
                 event.order_id,
             )
+            return
 
-        # Later: re-place or float grid here
+        # Mark level as inactive (this particular order is done)
+        level.active = False
+        self.log.info(
+            "Grid level filled: order_id=%s side=%s price=%.6f qty=%.4f",
+            event.order_id,
+            event.side.value,
+            event.price,
+            event.qty,
+        )
+
+        # Apply Binance neighbor rule:
+        #   BUY filled at p[i]  -> place SELL at p[i+1]
+        #   SELL filled at p[i] -> place BUY  at p[i-1]
+        if event.side == Side.BUY:
+            self._on_buy_filled(level)
+        elif event.side == Side.SELL:
+            self._on_sell_filled(level)
 
     # ------------------------------------------------------------
-    # Internal helpers
+    # Internal helpers: grid building & seeding
     # ------------------------------------------------------------
     def _compute_range(self, start_price: float) -> tuple[float, float]:
         """
@@ -180,6 +215,12 @@ class SimpleGridStrategy(BaseStrategy):
         return lower, upper
 
     def _build_initial_grid(self, start_price: float) -> None:
+        """
+        Build the list of grid price levels p0 < p1 < ... < pN.
+
+        At this stage we only define prices; side/active flags will be
+        set in _seed_initial_orders based on Binance-like rules.
+        """
         lower, upper = self._compute_range(start_price)
 
         if self.config.spacing == GridSpacing.GEOMETRIC and lower <= 0.0:
@@ -187,35 +228,43 @@ class SimpleGridStrategy(BaseStrategy):
 
         self._grid_levels.clear()
 
-        # number of levels (price lines) = n_levels
         if self.config.spacing == GridSpacing.ARITHMETIC:
             # Equal absolute step between prices, including lower and upper
             step = (upper - lower) / (self.config.n_levels - 1)
+            self._step = step
+            self._ratio = None
+
             for i in range(self.config.n_levels):
                 price = lower + i * step
-                side = Side.BUY if price < start_price else Side.SELL
                 level = GridLevel(
                     price=price,
-                    side=side,
+                    side=Side.BUY,                 # placeholder, will be set later
                     size=self.config.base_order_size,
+                    active=False,                  # inactive until seeded
                 )
                 self._grid_levels.append(level)
 
         elif self.config.spacing == GridSpacing.GEOMETRIC:
             # Equal ratio between successive prices, including lower and upper
             ratio = (upper / lower) ** (1.0 / (self.config.n_levels - 1))
+            self._ratio = ratio
+            self._step = None
+
             for i in range(self.config.n_levels):
                 price = lower * (ratio ** i)
-                side = Side.BUY if price < start_price else Side.SELL
                 level = GridLevel(
                     price=price,
-                    side=side,
+                    side=Side.BUY,                 # placeholder
                     size=self.config.base_order_size,
+                    active=False,
                 )
                 self._grid_levels.append(level)
 
         else:
             raise ValueError(f"Unknown spacing type: {self.config.spacing}")
+
+        self._lower = lower
+        self._upper = upper
 
         self.log.info(
             "Built initial grid for %s with %d levels in [%0.6f, %0.6f].",
@@ -225,26 +274,162 @@ class SimpleGridStrategy(BaseStrategy):
             upper,
         )
 
-    def _create_orders_for_active_levels(self) -> List[Order]:
+    def _create_order_for_level(self, level: GridLevel) -> Order:
+        order_id = str(uuid4())
+        order = Order(
+            id=order_id,
+            symbol=self.config.symbol,
+            side=level.side,
+            price=level.price,
+            qty=level.size,
+            type=OrderType.LIMIT,
+        )
+        self._order_to_level[order_id] = level
+        return order
+
+    def _seed_initial_orders(self, start_price: float) -> List[Order]:
+        """
+        Binance-like seeding:
+
+          Let prices = sorted grid prices p0 < p1 < ... < pN.
+
+          - Find k = max i where p[i] < start_price.
+          - Place BUY at p[0..k].
+          - Skip p[k+1].
+          - Place SELL at p[k+2..N].
+
+        This approximates the behavior described in Binance docs where
+        buys are below current price, sells are above, and a middle level
+        around current price may start empty.
+        """
+        prices = [lvl.price for lvl in self._grid_levels]
+        n = len(prices) - 1
+
+        # find k: highest index where p[i] < start_price
+        k: Optional[int] = None
+        for i, p in enumerate(prices):
+            if p < start_price:
+                k = i
+            else:
+                break
+        if k is None:
+            # start price <= lowest grid -> treat as all sells above
+            k = -1
+
         orders: List[Order] = []
-        for level in self._grid_levels:
-            if not level.active:
-                continue
-            order_id = str(uuid4())
-            order = Order(
-                id=order_id,
-                symbol=self.config.symbol,
-                side=level.side,
-                price=level.price,
-                qty=level.size,
-                type=OrderType.LIMIT,
-            )
-            self._order_to_level[order_id] = level
+
+        # BUYs below current (indices 0..k)
+        for i in range(0, k + 1):
+            lvl = self._grid_levels[i]
+            lvl.side = Side.BUY
+            lvl.active = True
+            order = self._create_order_for_level(lvl)
+            orders.append(order)
+
+        # SELLs above current, skipping immediate neighbor (k+1)
+        for i in range(k + 2, n + 1):
+            lvl = self._grid_levels[i]
+            lvl.side = Side.SELL
+            lvl.active = True
+            order = self._create_order_for_level(lvl)
             orders.append(order)
 
         self.log.info(
-            "Created %d orders for active grid levels (%s).",
-            len(orders),
-            self.config.symbol,
+            "Seeded initial Binance-style grid: %d BUY levels (0..%d), %d SELL levels (%d..%d), skipped index %d.",
+            k + 1,
+            k,
+            max(0, n - (k + 1)),
+            k + 2 if k + 2 <= n else -1,
+            n,
+            k + 1,
         )
         return orders
+
+    # ------------------------------------------------------------
+    # Internal helpers: neighbor rule
+    # ------------------------------------------------------------
+    def _level_index(self, level: GridLevel) -> int:
+        """Return the index of the level in _grid_levels."""
+        for i, lvl in enumerate(self._grid_levels):
+            if lvl is level:
+                return i
+        raise ValueError("Level not found in _grid_levels.")
+
+    def _on_buy_filled(self, level: GridLevel) -> None:
+        """
+        BUY filled at p[i] -> place SELL at p[i+1] (if exists and inactive).
+        """
+        idx = self._level_index(level)
+        next_idx = idx + 1
+        if next_idx >= len(self._grid_levels):
+            # no grid above -> at upper edge
+            self.log.debug(
+                "BUY filled at topmost level idx=%d price=%.6f, no neighbor above.",
+                idx,
+                level.price,
+            )
+            return
+
+        neighbor = self._grid_levels[next_idx]
+        if neighbor.active:
+            # already has an order, don't double-book
+            self.log.debug(
+                "BUY filled at idx=%d price=%.6f, neighbor SELL at idx=%d price=%.6f already active.",
+                idx,
+                level.price,
+                next_idx,
+                neighbor.price,
+            )
+            return
+
+        neighbor.side = Side.SELL
+        neighbor.active = True
+        order = self._create_order_for_level(neighbor)
+        self._pending_orders.append(order)
+
+        self.log.info(
+            "Neighbor rule: BUY filled at %.6f (idx=%d) -> placed SELL at neighbor %.6f (idx=%d)",
+            level.price,
+            idx,
+            neighbor.price,
+            next_idx,
+        )
+
+    def _on_sell_filled(self, level: GridLevel) -> None:
+        """
+        SELL filled at p[i] -> place BUY at p[i-1] (if exists and inactive).
+        """
+        idx = self._level_index(level)
+        prev_idx = idx - 1
+        if prev_idx < 0:
+            # no grid below -> lower edge
+            self.log.debug(
+                "SELL filled at lowest level idx=%d price=%.6f, no neighbor below.",
+                idx,
+                level.price,
+            )
+            return
+
+        neighbor = self._grid_levels[prev_idx]
+        if neighbor.active:
+            self.log.debug(
+                "SELL filled at idx=%d price=%.6f, neighbor BUY at idx=%d price=%.6f already active.",
+                idx,
+                level.price,
+                prev_idx,
+                neighbor.price,
+            )
+            return
+
+        neighbor.side = Side.BUY
+        neighbor.active = True
+        order = self._create_order_for_level(neighbor)
+        self._pending_orders.append(order)
+
+        self.log.info(
+            "Neighbor rule: SELL filled at %.6f (idx=%d) -> placed BUY at neighbor %.6f (idx=%d)",
+            level.price,
+            idx,
+            neighbor.price,
+            prev_idx,
+        )

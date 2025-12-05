@@ -1,3 +1,4 @@
+#backtester\infra\config\strategy_grid.py
 from __future__ import annotations
 
 from typing import Optional, Literal
