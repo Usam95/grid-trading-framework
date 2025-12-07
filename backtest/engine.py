@@ -109,7 +109,7 @@ class BacktestEngine:
             new_orders = self.strategy.on_candle(candle, self.account) or []
 
             if new_orders:
-                self.log.info(
+                self.log.debug(
                     "on_candle: ts=%s close=%.6f -> strategy produced %d new orders",
                     candle.timestamp,
                     candle.close,
@@ -123,7 +123,7 @@ class BacktestEngine:
                 self._open_orders[order.id] = order
                 self._all_orders.append(order)
 
-                self.log.info(
+                self.log.debug(
                     "New order: id=%s side=%s price=%.6f qty=%.4f type=%s",
                     order.id,
                     order.side.value,
@@ -139,7 +139,7 @@ class BacktestEngine:
             for event in filled_events:
                 fee = event.price * event.qty * self.engine_cfg.trading_fee_pct
 
-                self.log.info(
+                self.log.debug(
                     "Order fill: order_id=%s side=%s price=%.6f qty=%.4f ts=%s fee=%.6f",
                     event.order_id,
                     event.side.value,
@@ -358,7 +358,7 @@ class BacktestEngine:
             old_cash = self.account.cash_balance
             self.account.cash_balance -= notional + fee
 
-            self.log.info(
+            self.log.debug(
                 "BUY fill -> opened position %s: size=%.4f entry=%.6f, fee=%.6f; cash %.2f -> %.2f",
                 pos_id,
                 event.qty,
@@ -377,7 +377,7 @@ class BacktestEngine:
             ]
             if not open_positions:
                 # Nothing to close – in grid spot trading this shouldn't happen
-                self.log.warning(
+                self.log.debug(
                     "SELL fill with no open LONG position for symbol=%s. Ignoring.",
                     event.symbol,
                 )
@@ -398,7 +398,7 @@ class BacktestEngine:
             old_cash = self.account.cash_balance
             self.account.cash_balance += notional - fee
 
-            self.log.info(
+            self.log.debug(
                 "SELL fill -> closed position %s: size=%.4f entry=%.6f exit=%.6f gross_pnl=%.6f total_fee=%.6f realized_pnl=%.6f; cash %.2f -> %.2f",
                 pos.id,
                 pos.size,

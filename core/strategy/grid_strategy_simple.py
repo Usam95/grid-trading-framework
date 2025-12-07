@@ -158,7 +158,7 @@ class SimpleGridStrategy(BaseStrategy):
 
         # Mark level as inactive (this particular order is done)
         level.active = False
-        self.log.info(
+        self.log.debug(
             "Grid level filled: order_id=%s side=%s price=%.6f qty=%.4f",
             event.order_id,
             event.side.value,
@@ -387,7 +387,7 @@ class SimpleGridStrategy(BaseStrategy):
         order = self._create_order_for_level(neighbor)
         self._pending_orders.append(order)
 
-        self.log.info(
+        self.log.debug(
             "Neighbor rule: BUY filled at %.6f (idx=%d) -> placed SELL at neighbor %.6f (idx=%d)",
             level.price,
             idx,
@@ -426,7 +426,7 @@ class SimpleGridStrategy(BaseStrategy):
         order = self._create_order_for_level(neighbor)
         self._pending_orders.append(order)
 
-        self.log.info(
+        self.log.debug(
             "Neighbor rule: SELL filled at %.6f (idx=%d) -> placed BUY at neighbor %.6f (idx=%d)",
             level.price,
             idx,

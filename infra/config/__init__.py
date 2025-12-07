@@ -7,6 +7,8 @@ from .strategy_grid import GridStrategyConfig, StrategyConfig
 from .logging_config import LoggingConfig
 from .research_config import GridResearchConfig, GridParamGridConfig
 from .run_config import RunConfig
+from .strategy_grid import GridStrategyConfig, DynamicGridStrategyConfig, StrategyConfig
+
 
 __all__ = [
     # Data
@@ -26,6 +28,7 @@ __all__ = [
     # Research
     "GridResearchConfig",
     "GridParamGridConfig",
+    "DynamicGridStrategyConfig"
     # Top-level run config
     "RunConfig",
 ]

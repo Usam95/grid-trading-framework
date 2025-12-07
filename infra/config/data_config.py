@@ -45,6 +45,19 @@ class DataSplitConfig(BaseModel):
         return v
 
 
+
+class IndicatorConfig(BaseModel):
+    # all empty lists => no indicators computed
+    compute_atr: bool = True
+    atr_periods: List[int] = Field(default_factory=lambda: [14])
+
+    compute_ema: bool = False
+    ema_periods: List[int] = Field(default_factory=list)   # e.g. [9, 20, 50]
+
+    compute_rsi: bool = False
+    rsi_periods: List[int] = Field(default_factory=list)   # e.g. [14]
+
+    
 class LocalDataConfig(BaseModel):
     """
     Configuration for loading historical candles from local files.
@@ -112,6 +125,8 @@ class LocalDataConfig(BaseModel):
             "forward segment. Mainly used by research runners."
         ),
     )
+
+    indicators: IndicatorConfig = Field(default_factory=IndicatorConfig)
 
     class Config:
         arbitrary_types_allowed = True

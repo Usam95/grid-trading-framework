@@ -140,7 +140,7 @@ class GridResearchRunner:
                     best_params = params
                     best_timeframe = timeframe
                     best_train_result = train_result
-                    log.info(
+                    log.debug(
                         "New best config: score=%.4f timeframe=%s params=%s",
                         best_score,
                         best_timeframe,

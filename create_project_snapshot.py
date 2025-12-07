@@ -38,6 +38,7 @@ DEFAULT_EXCLUDED_DIRS = {
     "resultings",
     ".terraform",
     "tests", 
+    "output",
     "create_project_snapshot.py"
 }
 
