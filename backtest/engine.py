@@ -21,10 +21,13 @@ from core.strategy.base import IStrategy
 from infra.data_source import LocalFileDataSource, DatasetConfig
 from infra.config import BacktestEngineConfig, LocalDataConfig
 from infra.logging_setup import get_logger
+from infra.indicators import enrich_indicators
 
 from core.results.models import BacktestResult, EquityPoint
 from core.results.trade_builder import TradeBuilder
 from core.results.metrics import MetricRegistry, create_default_metric_registry
+
+
 
 
 class BacktestEngine:
@@ -211,6 +214,11 @@ class BacktestEngine:
     # Data loading
     # ----------------------------------------------------------------
     def _load_raw_data(self) -> pd.DataFrame:
+        """
+        Load raw OHLCV data for the configured symbol/timeframe, then
+        optionally enrich it with indicators (ATR/EMA/RSI) according to
+        self.data_cfg.indicators.
+        """
         cfg = DatasetConfig(
             symbol=self.data_cfg.symbol,
             start=self.data_cfg.start,
@@ -222,7 +230,9 @@ class BacktestEngine:
         required_cols = {"Open", "High", "Low", "Close", "Volume"}
         missing = required_cols - set(df.columns)
         if missing:
-            raise ValueError(f"Data for {self.data_cfg.symbol} is missing columns: {missing}")
+            raise ValueError(
+                f"Data for {self.data_cfg.symbol} is missing columns: {missing}"
+            )
 
         # Log some basic info about the loaded data
         first_ts = df.index[0]
@@ -245,37 +255,64 @@ class BacktestEngine:
                 approx_delta,
             )
 
+        # ------------------------------------------------------------------
+        # Enrich with technical indicators (ATR/EMA/RSI)
+        # ------------------------------------------------------------------
+        if hasattr(self.data_cfg, "indicators"):
+            before_cols = set(df.columns)
+            df = enrich_indicators(df, self.data_cfg.indicators)
+            after_cols = set(df.columns)
+            added_cols = sorted(after_cols - before_cols)
+            if added_cols:
+                self.log.info(
+                    "Indicator columns added for %s: %s",
+                    self.data_cfg.symbol,
+                    ", ".join(added_cols),
+                )
+            else:
+                self.log.info(
+                    "No indicator columns added for %s (config may be empty).",
+                    self.data_cfg.symbol,
+                )
+
         return df
+
 
 
     def _to_candles(self, df: pd.DataFrame) -> List[Candle]:
         """
-        Convert OHLCV DataFrame (with datetime index and columns
-        ['Open', 'High', 'Low', 'Close', 'Volume']) to a list of Candle objects.
+        Convert OHLCV(+indicator) DataFrame (datetime index + columns
+        ['Open', 'High', 'Low', 'Close', 'Volume', ...indicators...])
+        to a list of Candle objects.
 
-        Faster than iterrows() because it uses itertuples().
-        Assumes the index is the candle timestamp.
+        - Base OHLCV go into the dedicated fields.
+        - All additional numeric columns go into Candle.extra.
         """
         candles: List[Candle] = []
         append = candles.append
 
-        # This yields tuples in the form:
-        # (index, Open, High, Low, Close, Volume)
-        for ts, open_, high_, low_, close_, volume in df.itertuples(
-            index=True, name=None
-        ):
+        base_cols = {"Open", "High", "Low", "Close", "Volume"}
+        # Everything else (ATR_*, EMA_*, RSI_* etc.) is treated as "extra".
+        extra_cols = [c for c in df.columns if c not in base_cols]
+
+        # This yields tuples with attributes accessible by column name
+        for row in df.itertuples(index=True, name="Row"):
+            extras = {col: getattr(row, col) for col in extra_cols}
+
             append(
                 Candle(
-                    timestamp=ts,   # same as before: index used as timestamp
-                    open=open_,
-                    high=high_,
-                    low=low_,
-                    close=close_,
-                    volume=volume,
+                    timestamp=row.Index,  # index used as timestamp
+                    open=row.Open,
+                    high=row.High,
+                    low=row.Low,
+                    close=row.Close,
+                    volume=row.Volume,
+                    extra=extras,
                 )
             )
 
         return candles
+
 
     # ----------------------------------------------------------------
     # Fill simulation

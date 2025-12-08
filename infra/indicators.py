@@ -1,43 +1,39 @@
 # infra/indicators.py
-
 from __future__ import annotations
+
+from typing import Iterable
 
 import pandas as pd
 
 from infra.config.data_config import IndicatorConfig
 
 
-# ----------------------------------------------------------------------
-# Helper functions: indicator column names
-# ----------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Key helpers – single source of truth for column names
+# ---------------------------------------------------------------------------
 
 def atr_key(period: int) -> str:
-    """Column name for ATR with given period."""
     return f"ATR_{period}"
 
 
+def ema_key(period: int) -> str:
+    return f"EMA_{period}"
+
+
 def rsi_key(period: int) -> str:
-    """Column name for RSI with given period."""
     return f"RSI_{period}"
 
 
-def ema_key(period: int, col: str = "Close") -> str:
-    """Column name for EMA on a given column (default: Close)."""
-    return f"EMA_{period}_{col.upper()}"
+# ---------------------------------------------------------------------------
+# Low-level indicator implementations
+# ---------------------------------------------------------------------------
 
-
-# ----------------------------------------------------------------------
-# Per-indicator adders (mutate df in-place and also return it)
-# ----------------------------------------------------------------------
-
-
-def add_atr(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+def _add_atr(df: pd.DataFrame, period: int) -> None:
     """
-    Add an ATR column with the given period.
+    Add an ATR_<period> column in-place.
 
-    Uses classic True Range and simple moving average over 'period'.
-    Expects columns: 'High', 'Low', 'Close'.
+    Assumes df has 'High', 'Low', 'Close' columns.
     """
     high = df["High"]
     low = df["Low"]
@@ -54,69 +50,62 @@ def add_atr(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
     ).max(axis=1)
 
     df[atr_key(period)] = tr.rolling(period, min_periods=period).mean()
-    return df
 
 
-def add_ema(df: pd.DataFrame, period: int, col: str = "Close") -> pd.DataFrame:
+def _add_ema(df: pd.DataFrame, period: int) -> None:
     """
-    Add an EMA column with the given period on the given source column
-    (default: 'Close').
+    Add an EMA_<period> column in-place on Close.
     """
-    name = ema_key(period, col)
-    df[name] = df[col].ewm(span=period, adjust=False).mean()
-    return df
+    df[ema_key(period)] = df["Close"].ewm(span=period, adjust=False).mean()
 
 
-def add_rsi(df: pd.DataFrame, period: int, col: str = "Close") -> pd.DataFrame:
+def _add_rsi(df: pd.DataFrame, period: int) -> None:
     """
-    Add an RSI column with the given period on the given source column
-    (default: 'Close').
+    Add an RSI_<period> column in-place on Close.
+    Classic Wilder-style RSI.
     """
-    name = rsi_key(period)
-    delta = df[col].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    close = df["Close"]
+    delta = close.diff()
 
-    avg_gain = gain.rolling(period, min_periods=period).mean()
-    avg_loss = loss.rolling(period, min_periods=period).mean()
+    gain = (delta.clip(lower=0)).rolling(period, min_periods=period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period, min_periods=period).mean()
 
-    rs = avg_gain / avg_loss
-    df[name] = 100 - (100 / (1 + rs))
-    return df
+    rs = gain / loss.replace(0, pd.NA)
+    rsi = 100 - (100 / (1 + rs))
+
+    df[rsi_key(period)] = rsi
 
 
-# ----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # High-level enrichment
-# ----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
-
-def enrich_indicators(df: pd.DataFrame, cfg: IndicatorConfig | None) -> pd.DataFrame:
+def enrich_indicators(df: pd.DataFrame, cfg: IndicatorConfig) -> pd.DataFrame:
     """
-    Compute all indicators configured in IndicatorConfig and attach them
-    as new columns to the DataFrame.
+    Compute all requested indicators in-place on df and return df.
 
-    - ATR columns:  ATR_<period>
-    - EMA columns:  EMA_<period>_<COL> (currently COL == 'CLOSE')
-    - RSI columns:  RSI_<period>
+    Uses the lists from IndicatorConfig:
+      - atr_periods
+      - ema_periods
+      - rsi_periods
 
-    All computations are in-place; df is also returned for convenience.
+    If any list is empty or the corresponding `compute_*` flag is False,
+    that indicator type is skipped.
     """
-    if cfg is None:
-        return df
 
-    # ATRs
+    # --- ATR ---
     if cfg.compute_atr:
         for period in cfg.atr_periods:
-            add_atr(df, period)
+            _add_atr(df, period)
 
-    # RSIs
-    if cfg.compute_rsi:
-        for period in cfg.rsi_periods:
-            add_rsi(df, period)
-
-    # EMAs
+    # --- EMA ---
     if cfg.compute_ema:
         for period in cfg.ema_periods:
-            add_ema(df, period)
+            _add_ema(df, period)
+
+    # --- RSI ---
+    if cfg.compute_rsi:
+        for period in cfg.rsi_periods:
+            _add_rsi(df, period)
 
     return df
