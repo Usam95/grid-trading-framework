@@ -5,9 +5,13 @@ import csv
 import json
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
+from datetime import datetime
 from typing import Any, Dict
 
 from .models import BacktestResult, Trade, EquityPoint
+
+
+FLOAT_DECIMALS = 4
 
 
 def _ensure_dir(path: Path) -> None:
@@ -21,17 +25,62 @@ def _serialize_enum(value: Any) -> Any:
     return str(value)
 
 
+def _fmt_float(value: Any, ndigits: int = FLOAT_DECIMALS) -> Any:
+    """
+    Format floats for CSV output with fixed decimals.
+    Returns the original value for non-floats.
+    """
+    if isinstance(value, float):
+        return f"{value:.{ndigits}f}"
+    return value
+
+
+def _to_serializable(obj: Any, ndigits: int = FLOAT_DECIMALS) -> Any:
+    """
+    Convert an object into JSON-serializable structures and
+    round floats recursively to the given precision.
+    """
+    if is_dataclass(obj):
+        obj = asdict(obj)
+
+    # Enums
+    if hasattr(obj, "value") and not isinstance(obj, (str, int, float, bool, dict, list, tuple)):
+        try:
+            return obj.value
+        except Exception:
+            pass
+
+    # Datetime-like
+    if hasattr(obj, "isoformat") and not isinstance(obj, (str, int, float, bool, dict, list, tuple)):
+        try:
+            return obj.isoformat()
+        except Exception:
+            pass
+
+    if isinstance(obj, dict):
+        return {k: _to_serializable(v, ndigits) for k, v in obj.items()}
+
+    if isinstance(obj, (list, tuple)):
+        return [_to_serializable(v, ndigits) for v in obj]
+
+    if isinstance(obj, float):
+        return round(obj, ndigits)
+
+    return obj
+
+
 def save_backtest_result(result: BacktestResult, base_dir: Path | str = "results") -> Path:
     """
     Save a BacktestResult into:
-      results/<run_id>/
+      results/<timestamp>/
         - summary.json
         - trades.csv
         - equity_curve.csv
         - extra.json (optional)
     """
     base_dir = Path(base_dir)
-    run_dir = base_dir / result.run_id
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = base_dir / ts
     _ensure_dir(run_dir)
 
     # ------------------------------------------------------------------
@@ -49,8 +98,10 @@ def save_backtest_result(result: BacktestResult, base_dir: Path | str = "results
         "metrics": result.metrics,
     }
 
+    summary_serializable = _to_serializable(summary, FLOAT_DECIMALS)
+
     with (run_dir / "summary.json").open("w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
+        json.dump(summary_serializable, f, indent=2)
 
     # ------------------------------------------------------------------
     # 2) Trades (CSV)
@@ -72,19 +123,18 @@ def save_backtest_result(result: BacktestResult, base_dir: Path | str = "results
         writer = csv.DictWriter(f, fieldnames=trade_fields)
         writer.writeheader()
         for t in result.trades:
-            # assuming Trade(dataclass) with fields as defined in models.py
             writer.writerow(
                 {
                     "trade_id": t.id,
                     "symbol": t.symbol,
                     "side": _serialize_enum(t.side),
-                    "size": t.size,
-                    "entry_price": t.entry_price,
+                    "size": _fmt_float(t.size),
+                    "entry_price": _fmt_float(t.entry_price),
                     "entry_time": t.entry_time.isoformat(),
-                    "exit_price": t.exit_price,
+                    "exit_price": _fmt_float(t.exit_price),
                     "exit_time": t.exit_time.isoformat(),
-                    "realized_pnl": t.net_pnl,
-                    "fee": getattr(t, "fee", 0.0),
+                    "realized_pnl": _fmt_float(t.net_pnl),
+                    "fee": _fmt_float(getattr(t, "fee", 0.0)),
                 }
             )
 
@@ -95,23 +145,15 @@ def save_backtest_result(result: BacktestResult, base_dir: Path | str = "results
         writer = csv.writer(f)
         writer.writerow(["time", "equity"])
         for p in result.equity_curve:
-            writer.writerow([p.timestamp.isoformat(), p.equity])
+            writer.writerow([p.timestamp.isoformat(), _fmt_float(p.equity)])
 
     # ------------------------------------------------------------------
     # 4) Extra data (JSON, if present)
     # ------------------------------------------------------------------
     if result.extra:
-        def default(o: Any) -> Any:
-            # best-effort serializer for misc objects
-            if is_dataclass(o):
-                return asdict(o)
-            if hasattr(o, "isoformat"):
-                return o.isoformat()
-            if hasattr(o, "value"):
-                return o.value
-            return str(o)
+        extra_serializable = _to_serializable(result.extra, FLOAT_DECIMALS)
 
         with (run_dir / "extra.json").open("w", encoding="utf-8") as f:
-            json.dump(result.extra, f, indent=2, default=default)
+            json.dump(extra_serializable, f, indent=2)
 
     return run_dir

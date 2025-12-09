@@ -11,7 +11,7 @@ data:
   timeframe: "5m"
 
   # Adjust these according to your downloaded data range
-  start: "2025-05-05T00:00:00"
+  start: "2025-01-05T00:00:00"
   end:   "2025-11-20T23:59:00"
   root: "historical_data"
 
@@ -70,6 +70,16 @@ strategy:
   # absolute range not used in PERCENT mode
   lower_price: null
   upper_price: null
+
+  use_rsi_filter: false
+  rsi_period: 14
+  rsi_min: 30
+  rsi_max: 70
+
+  use_trend_filter: false
+  ema_period: 100
+  max_deviation_pct: 0.1
+
 
 logging:
   name: "xrpresearch"

@@ -8,6 +8,7 @@ from .models import BacktestResult
 
 import pandas as pd
 
+
 def print_result_summary(result: BacktestResult, logger: Optional[logging.Logger] = None) -> None:
     """
     Print a human-readable summary of the backtest.
@@ -30,7 +31,7 @@ def print_result_summary(result: BacktestResult, logger: Optional[logging.Logger
         for name, value in sorted(result.metrics.items()):
             # try to format numbers nicely
             if isinstance(value, float):
-                out(f"  {name:20s} {value: .6f}")
+                out(f"  {name:20s} {value: .4f}")
             else:
                 out(f"  {name:20s} {value}")
     else:
@@ -41,6 +42,7 @@ def print_result_summary(result: BacktestResult, logger: Optional[logging.Logger
     out(f"Trades:    {len(result.trades)}")
     out(f"Equity points: {len(result.equity_curve)}")
     out("")
+
 
 def result_to_dataframes(result: BacktestResult):
     """
@@ -78,4 +80,3 @@ def result_to_dataframes(result: BacktestResult):
     trades_df = pd.DataFrame(trades_rows)
     equity_df = pd.DataFrame(equity_rows)
     return trades_df, equity_df
-
