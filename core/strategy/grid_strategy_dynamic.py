@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 from core.models import Candle, AccountState, Order, OrderFilledEvent
 from core.strategy.base import BaseStrategy
@@ -13,6 +13,8 @@ from core.strategy.grid_strategy_simple import (
     SimpleGridStrategy,
 )
 from core.strategy.policies.filter import FilterPolicy
+from core.strategy.policies.range import RangePolicy
+from infra.indicators import atr_key
 from infra.logging_setup import get_logger
 
 
@@ -24,13 +26,15 @@ class DynamicGridConfig(GridConfig):
     It extends the basic GridConfig (percent/absolute band + spacing)
     with ATR, SL/TP, floating and filter options.
 
-    For now, ATR / SLTP / recentering are not yet wired in. Only the
-    filter policy (RSI + trend) is active. In later steps we will
-    gradually activate the remaining policies.
+    Currently active:
+      - FilterPolicy (RSI + trend)
+      - ATR-based initial band via RangePolicy
+
+    SL/TP and recentering will be wired in later.
     """
 
     # --- ATR / spacing / range ---
-    spacing_mode: str = "percent"   # "percent" | "atr"
+    spacing_mode: str = "percent"   # "percent" | "atr" (currently unused)
     spacing_pct: float = 0.007
     spacing_atr_mult: float = 0.5
     range_atr_lower_mult: float = 3.0
@@ -63,6 +67,9 @@ class DynamicGridConfig(GridConfig):
     ema_period: int = 100
     max_deviation_pct: float = 0.1
 
+    # TODO (later): explicitly add atr_period_for_range if you want
+    # to use something other than ATR_14.
+
 
 class DynamicGridStrategy(BaseStrategy):
     """
@@ -73,8 +80,9 @@ class DynamicGridStrategy(BaseStrategy):
       - Applies FilterPolicy (RSI / EMA-deviation) before calling the
         inner strategy:
           * If filters say "no": no new orders are created for this candle.
-          * If filters say "yes": we forward the candle to the inner
-            SimpleGridStrategy and return its orders.
+          * If filters say "yes": we lazily initialise the internal
+            SimpleGridStrategy with an ATR-based band and then forward
+            the candle to it.
 
     This matches the 'grid.dynamic' kind in DynamicGridStrategyConfig.
     """
@@ -83,42 +91,94 @@ class DynamicGridStrategy(BaseStrategy):
         self.config = config
         self.log = get_logger("strategy.grid.dynamic")
 
-        # For now, delegate core grid behaviour to SimpleGridStrategy.
-        base_cfg = GridConfig(
-            symbol=config.symbol,
-            base_order_size=config.base_order_size,
-            n_levels=config.n_levels,
-            lower_pct=config.lower_pct,
-            upper_pct=config.upper_pct,
-            lower_price=config.lower_price,
-            upper_price=config.upper_price,
-            range_mode=config.range_mode,
-            spacing=config.spacing,
-        )
-        self._inner = SimpleGridStrategy(base_cfg)
+        # Will be created lazily on the first candle that passes filters
+        self._inner: Optional[SimpleGridStrategy] = None
 
-        # Build filter policy (RSI + trend). It expects a config-like
-        # object with attributes:
-        #   use_rsi_filter, rsi_period, rsi_min, rsi_max,
-        #   use_trend_filter, ema_period, max_deviation_pct
+        # Filter policy (RSI + trend) uses config attributes directly
         self.filter_policy = FilterPolicy(cfg=config)
 
+        # Range policy: we use ATR-based band as default for dynamic grid.
+        # For now we assume ATR_14 is computed (see IndicatorConfig).
+        # If ATR is not ready yet, RangePolicy will fall back to percent.
+        fallback_pct = (
+            config.lower_pct
+            if config.lower_pct is not None
+            else (config.upper_pct if config.upper_pct is not None else 0.10)
+        )
+
+        self.range_policy = RangePolicy(
+            mode="atr",                                   # ATR-based band
+            lower_pct=config.lower_pct,                  # used as fallback
+            upper_pct=config.upper_pct,
+            atr_mult_lower=config.range_atr_lower_mult,
+            atr_mult_upper=config.range_atr_upper_mult,
+            atr_key=atr_key(14),                         # ATR_14 by convention
+            fallback_pct=fallback_pct,
+        )
+
+        self.activate_filters()
+
+    # ------------------------------------------------------------------ #
+    # Helper: filter logging
+    # ------------------------------------------------------------------ #
+    def activate_filters(self) -> None:
         filters_active: list[str] = []
-        if config.use_rsi_filter:
+        if self.config.use_rsi_filter:
             filters_active.append(
-                f"RSI(period={config.rsi_period}, "
-                f"range=[{config.rsi_min}, {config.rsi_max}]"
+                f"RSI(period={self.config.rsi_period}, "
+                f"range=[{self.config.rsi_min}, {self.config.rsi_max}]"
             )
-        if config.use_trend_filter:
+        if self.config.use_trend_filter:
             filters_active.append(
-                f"EMA(period={config.ema_period}, "
-                f"max_dev={config.max_deviation_pct})"
+                f"EMA(period={self.config.ema_period}, "
+                f"max_dev={self.config.max_deviation_pct})"
             )
 
         if filters_active:
-            self.log.info("DynamicGridStrategy filters enabled: %s", "; ".join(filters_active))
+            self.log.info(
+                "DynamicGridStrategy filters enabled: %s",
+                "; ".join(filters_active),
+            )
         else:
             self.log.info("DynamicGridStrategy filters disabled.")
+
+    # ------------------------------------------------------------------ #
+    # Helper: lazy inner initialisation with ATR-based band
+    # ------------------------------------------------------------------ #
+    def _ensure_inner(self, candle: Candle) -> None:
+        """
+        Create the internal SimpleGridStrategy (self._inner) once, based
+        on the current candle and ATR-aware RangePolicy.
+
+        If already created, this is a no-op.
+        """
+        if self._inner is not None:
+            return
+
+        # Compute band around current price (prefer ATR, fallback to %)
+        lower, upper = self.range_policy.compute(candle)
+
+        base_cfg = GridConfig(
+            symbol=self.config.symbol,
+            base_order_size=self.config.base_order_size,
+            n_levels=self.config.n_levels,
+            lower_price=lower,
+            upper_price=upper,
+            lower_pct=None,
+            upper_pct=None,
+            range_mode=GridRangeMode.ABSOLUTE,
+            spacing=self.config.spacing,
+        )
+        self._inner = SimpleGridStrategy(base_cfg)
+
+        self.log.info(
+            "Initialized inner SimpleGridStrategy with band "
+            "[%.6f, %.6f] (width=%.6f) at %s",
+            lower,
+            upper,
+            upper - lower,
+            candle.timestamp,
+        )
 
     # ------------------------------------------------------------------ #
     # BaseStrategy interface
@@ -134,7 +194,6 @@ class DynamicGridStrategy(BaseStrategy):
         """
         # 1) Check filters (RSI / trend)
         if not self.filter_policy.allow_trading(candle):
-            # No new orders when filters are violated.
             self.log.info(
                 "Filters block trading at %s (close=%.6f)",
                 candle.timestamp,
@@ -142,7 +201,11 @@ class DynamicGridStrategy(BaseStrategy):
             )
             return []
 
-        # 2) Filters OK -> use normal simple grid logic
+        # 2) Ensure internal grid is initialised once (ATR-based band)
+        self._ensure_inner(candle)
+        assert self._inner is not None
+
+        # 3) Filters OK -> use normal simple grid logic
         return self._inner.on_candle(candle, account)
 
     def on_order_filled(self, event: OrderFilledEvent) -> None:
@@ -150,4 +213,14 @@ class DynamicGridStrategy(BaseStrategy):
         Forward fills to the inner strategy. Later we may also add SL/TP
         state updates here.
         """
+        if self._inner is None:
+            # This should not happen: fills imply that the inner strategy
+            # has already created orders.
+            self.log.warning(
+                "Received OrderFilledEvent but inner strategy "
+                "is not initialised yet: %s",
+                event,
+            )
+            return
+
         self._inner.on_order_filled(event)

@@ -8,7 +8,7 @@ data:
   symbol: "XRPUSDT"
 
   # Target timeframe for this run (raw data is 1m)
-  timeframe: "5m"
+  timeframe: "60m"
 
   # Adjust these according to your downloaded data range
   start: "2025-01-05T00:00:00"
@@ -33,11 +33,11 @@ data:
 
   indicators:
     compute_atr: true
-    atr_periods: [14]
+    atr_periods: [50]
     compute_ema: true
     ema_periods: [9, 20, 100]
     compute_rsi: true
-    rsi_periods: [14]
+    rsi_periods: [25]
 
 engine:
   mode: backtest

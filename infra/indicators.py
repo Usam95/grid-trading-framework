@@ -1,12 +1,11 @@
 # infra/indicators.py
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Iterable, List
 
 import pandas as pd
 
 from infra.config.data_config import IndicatorConfig
-
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +48,7 @@ def _add_atr(df: pd.DataFrame, period: int) -> None:
         axis=1,
     ).max(axis=1)
 
+    # classic: need 'period' values before ATR is valid
     df[atr_key(period)] = tr.rolling(period, min_periods=period).mean()
 
 
@@ -89,23 +89,37 @@ def enrich_indicators(df: pd.DataFrame, cfg: IndicatorConfig) -> pd.DataFrame:
       - ema_periods
       - rsi_periods
 
-    If any list is empty or the corresponding `compute_*` flag is False,
-    that indicator type is skipped.
+    After computing, we drop all rows that have NaN in ANY of the
+    requested indicator columns. This guarantees that every candle
+    used by the engine has fully valid indicator values.
     """
 
+    indicator_cols: List[str] = []
+
     # --- ATR ---
-    if cfg.compute_atr:
+    if cfg.compute_atr and cfg.atr_periods:
         for period in cfg.atr_periods:
             _add_atr(df, period)
+            indicator_cols.append(atr_key(period))
 
     # --- EMA ---
-    if cfg.compute_ema:
+    if cfg.compute_ema and cfg.ema_periods:
         for period in cfg.ema_periods:
             _add_ema(df, period)
+            indicator_cols.append(ema_key(period))
 
     # --- RSI ---
-    if cfg.compute_rsi:
+    if cfg.compute_rsi and cfg.rsi_periods:
         for period in cfg.rsi_periods:
             _add_rsi(df, period)
+            indicator_cols.append(rsi_key(period))
 
-    return df
+    # If no indicators were requested, just return df as-is
+    if not indicator_cols:
+        return df
+
+    # Drop all rows where ANY of the indicator columns is NaN
+    # This removes the warmup region for ATR/EMA/RSI.
+    df_clean = df.dropna(subset=indicator_cols).copy()
+
+    return df_clean
