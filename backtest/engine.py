@@ -17,7 +17,10 @@ from core.models import (
     AccountState,
     OrderFilledEvent,
 )
+
+from core.engine_actions import EngineAction, EngineActionType
 from core.strategy.base import IStrategy
+
 from infra.data_source import LocalFileDataSource, DatasetConfig
 from infra.config import BacktestEngineConfig, LocalDataConfig
 from infra.logging_setup import get_logger
@@ -26,8 +29,6 @@ from infra.indicators import enrich_indicators
 from core.results.models import BacktestResult, EquityPoint
 from core.results.trade_builder import TradeBuilder
 from core.results.metrics import MetricRegistry, create_default_metric_registry
-
-
 
 
 class BacktestEngine:
@@ -39,6 +40,12 @@ class BacktestEngine:
       - One position per filled BUY order (FIFO close on SELL).
       - Simple fill model based on candle OHLC.
       - Fees charged on notional of each fill.
+
+    IMPORTANT (cleaned architecture):
+      - Strategies return EngineAction objects (PLACE_ORDER / GRID_EXIT).
+      - The engine is the single authority for assigning Order.id.
+      - Order IDs are assigned as SYMBOL-N (e.g. "XRPUSDT-1").
+      - client_tag is propagated into OrderFilledEvent so strategies can map fills.
     """
 
     def __init__(
@@ -65,13 +72,18 @@ class BacktestEngine:
             invested_cost=0.0,
         )
 
-        self._open_orders: Dict[str, Order] = {}
-        self._open_positions: Dict[str, Position] = {}  # id -> Position
+        # Open orders/positions for the run
+        self._open_orders: Dict[str, Order] = {}          # order_id -> Order
+        self._open_positions: Dict[str, Position] = {}    # position_id -> Position
         self._equity_curve: List[EquityPoint] = []
         self._all_orders: List[Order] = []
 
         # Trade builder (logical trades from fills)
         self._trade_builder = TradeBuilder(symbol=self.data_cfg.symbol)
+
+        # Order ID sequencing (engine-owned):
+        # Each symbol has its own counter, producing IDs like: XRPUSDT-1, XRPUSDT-2, ...
+        self._order_seq_by_symbol: Dict[str, int] = {}
 
     # ----------------------------------------------------------------
     # Public API
@@ -99,40 +111,87 @@ class BacktestEngine:
             self.data_cfg.symbol,
         )
 
+        grid_exit_reason: Optional[str] = None
+
+        # ----------------------------------------------------------------
         # Main backtest loop
+        # ----------------------------------------------------------------
         for idx, candle in enumerate(candles):
             # Optional: support max_candles in engine_cfg
             if self.engine_cfg.max_candles is not None and idx >= self.engine_cfg.max_candles:
-                self.log.info(
-                    "Stopping early due to max_candles=%d", self.engine_cfg.max_candles
-                )
+                self.log.info("Stopping early due to max_candles=%d", self.engine_cfg.max_candles)
                 break
 
-            # Strategy decides on new orders based on the latest candle + account state
-            new_orders = self.strategy.on_candle(candle, self.account) or []
+            # Strategy decides on new actions based on latest candle + account state
+            actions = self.strategy.on_candle(candle, self.account) or []
 
-            if new_orders:
+            if actions:
                 self.log.debug(
-                    "on_candle: ts=%s close=%.6f -> strategy produced %d new orders",
+                    "on_candle: ts=%s close=%.6f -> strategy produced %d actions",
                     candle.timestamp,
                     candle.close,
-                    len(new_orders),
+                    len(actions),
                 )
 
-            # Ensure IDs on orders; store as open orders
-            for order in new_orders:
-                if not order.id:
-                    order.id = str(uuid4())
-                self._open_orders[order.id] = order
-                self._all_orders.append(order)
+            # Handle actions (GRID_EXIT and PLACE_ORDER)
+            for action in actions:
+                # -------------------------------
+                # GRID EXIT (global SL/TP)
+                # -------------------------------
+                if action.type == EngineActionType.GRID_EXIT:
+                    symbol = action.symbol or self.data_cfg.symbol
+                    reason = (action.exit_reason or "unknown").lower()
 
-                self.log.debug(
-                    "New order: id=%s side=%s price=%.6f qty=%.4f type=%s",
-                    order.id,
-                    order.side.value,
-                    order.price,
-                    order.qty,
-                    order.type.value,
+                    self.log.info(
+                        "Received GRID_EXIT action: symbol=%s reason=%s at %s",
+                        symbol,
+                        reason,
+                        candle.timestamp,
+                    )
+
+                    self._force_flatten_and_cancel(symbol, candle, reason)
+                    grid_exit_reason = reason
+
+                    # Stop processing further actions on this candle
+                    break
+
+                # -------------------------------
+                # PLACE ORDER
+                # -------------------------------
+                if action.type == EngineActionType.PLACE_ORDER:
+                    order = action.order
+                    if order is None:
+                        self.log.warning(
+                            "PLACE_ORDER action without order at %s – ignored",
+                            candle.timestamp,
+                        )
+                        continue
+
+                    # Engine is single authority for order IDs:
+                    # always assign/overwrite to ensure deterministic ID scheme.
+                    assigned_id = self._assign_order_id(order)
+
+                    self._open_orders[order.id] = order
+                    self._all_orders.append(order)
+
+                    self.log.debug(
+                        "New order accepted: id=%s side=%s price=%.6f qty=%.4f type=%s tag=%s",
+                        assigned_id,
+                        order.side.value,
+                        order.price,
+                        order.qty,
+                        order.type.value,
+                        order.client_tag,
+                    )
+                    continue
+
+                # -------------------------------
+                # Unknown action
+                # -------------------------------
+                self.log.warning(
+                    "Unknown EngineAction type=%s at %s",
+                    action.type,
+                    candle.timestamp,
                 )
 
             # Simulate fills for all open orders against this candle
@@ -143,13 +202,14 @@ class BacktestEngine:
                 fee = event.price * event.qty * self.engine_cfg.trading_fee_pct
 
                 self.log.debug(
-                    "Order fill: order_id=%s side=%s price=%.6f qty=%.4f ts=%s fee=%.6f",
+                    "Order fill: order_id=%s side=%s price=%.6f qty=%.4f ts=%s fee=%.6f tag=%s",
                     event.order_id,
                     event.side.value,
                     event.price,
                     event.qty,
                     event.filled_at,
                     fee,
+                    event.client_tag,
                 )
 
                 # Update positions & account (pass fee explicitly)
@@ -164,28 +224,35 @@ class BacktestEngine:
             # Recompute equity based on open positions at candle close
             self._update_equity(candle)
 
+            # Stop the backtest after a global grid exit
+            if grid_exit_reason is not None:
+                self.log.info(
+                    "Stopping backtest early due to grid_exit_reason=%s at %s",
+                    grid_exit_reason,
+                    candle.timestamp,
+                )
+                break
+
         # ---- After loop: build BacktestResult and compute metrics ----
 
-        final_equity = (
-            self._equity_curve[-1].equity if self._equity_curve else self.account.total_value
-        )
+        final_equity = self._equity_curve[-1].equity if self._equity_curve else self.account.total_value
 
         result = BacktestResult(
             run_id=str(uuid4()),
             run_name=f"{self.data_cfg.symbol}_backtest",
             symbol=self.data_cfg.symbol,
             timeframe=getattr(self.data_cfg, "timeframe", "unknown"),
-
             started_at=started_at,
             finished_at=datetime.now(),
-
-            # must match dataclass + tests
             initial_balance=self.engine_cfg.initial_balance,
             final_equity=final_equity,
-
             trades=self._trade_builder.get_trades(),
             equity_curve=self._equity_curve,
         )
+
+        # If we stopped due to a global grid SL/TP, persist the reason
+        if grid_exit_reason is not None:
+            result.extra["grid_exit_reason"] = grid_exit_reason
 
         # Keep positions & raw orders in extra so they’re still accessible
         result.extra["positions"] = list(self._open_positions.values())
@@ -200,15 +267,100 @@ class BacktestEngine:
         self.log.info(
             "Final total_value=%.2f (start=%.2f) -> total_return=%.2f%%, max_drawdown=%.2f%%, trades=%d, win_rate=%.2f%%",
             result.final_equity,
-            result.initial_balance,  # <- fixed name
+            result.initial_balance,
             result.metrics.get("total_return_pct", 0.0),
             result.metrics.get("max_drawdown_pct", 0.0),
             int(result.metrics.get("n_trades", 0.0)),
             result.metrics.get("win_rate_pct", 0.0),
         )
 
-
         return result
+
+    # ----------------------------------------------------------------
+    # Order ID assignment
+    # ----------------------------------------------------------------
+    def _assign_order_id(self, order: Order) -> str:
+        """
+        Assign engine-owned order ID as SYMBOL-N (e.g. XRPUSDT-1).
+
+        We always assign/overwrite to ensure:
+          - deterministic IDs
+          - strategies never rely on IDs (they should use client_tag)
+        """
+        symbol = order.symbol
+        next_n = self._order_seq_by_symbol.get(symbol, 0) + 1
+        self._order_seq_by_symbol[symbol] = next_n
+
+        new_id = f"{symbol}-{next_n}"
+
+        if order.id and order.id != new_id:
+            self.log.warning(
+                "Order already has id=%s but engine overwrites with id=%s (engine is the single authority).",
+                order.id,
+                new_id,
+            )
+
+        order.id = new_id
+        return new_id
+
+    # ----------------------------------------------------------------
+    # Forced grid exit (flatten + cancel)
+    # ----------------------------------------------------------------
+    def _force_flatten_and_cancel(self, symbol: str, candle: Candle, reason: str) -> None:
+        """
+        Force-flatten all open positions and cancel all open orders
+        for a symbol.
+
+        Used when a grid strategy sends a GRID_EXIT action
+        (global stop-loss / take-profit).
+        """
+        # 1) Cancel open orders for this symbol
+        remaining: Dict[str, Order] = {}
+        for order_id, order in self._open_orders.items():
+            if order.symbol != symbol:
+                remaining[order_id] = order
+            else:
+                self.log.info(
+                    "Grid exit %s: cancelling open order id=%s side=%s price=%.6f qty=%.4f tag=%s",
+                    reason,
+                    order_id,
+                    order.side.value,
+                    order.price,
+                    order.qty,
+                    order.client_tag,
+                )
+        self._open_orders = remaining
+
+        # 2) Close all open positions for this symbol (LONG-only MVP)
+        for pos_id, pos in list(self._open_positions.items()):
+            if pos.symbol != symbol or not pos.is_open:
+                continue
+
+            event = OrderFilledEvent(
+                order_id=f"GRID_EXIT_{reason.upper()}_{pos_id}",
+                symbol=pos.symbol,
+                side=Side.SELL,  # flatten LONG position
+                price=candle.close,
+                qty=pos.size,
+                filled_at=candle.timestamp,
+                client_tag=None,
+                position_id=pos.id,
+            )
+            fee = event.price * event.qty * self.engine_cfg.trading_fee_pct
+
+            self.log.info(
+                "Grid exit %s: closing position %s at %.6f qty=%.4f fee=%.6f",
+                reason,
+                pos_id,
+                event.price,
+                event.qty,
+                fee,
+            )
+
+            # Same flow as normal fills
+            self._apply_fill(event, fee)
+            self._trade_builder.on_fill(event, fee)
+            self.strategy.on_order_filled(event)
 
     # ----------------------------------------------------------------
     # Data loading
@@ -230,9 +382,7 @@ class BacktestEngine:
         required_cols = {"Open", "High", "Low", "Close", "Volume"}
         missing = required_cols - set(df.columns)
         if missing:
-            raise ValueError(
-                f"Data for {self.data_cfg.symbol} is missing columns: {missing}"
-            )
+            raise ValueError(f"Data for {self.data_cfg.symbol} is missing columns: {missing}")
 
         # Log some basic info about the loaded data
         first_ts = df.index[0]
@@ -249,11 +399,7 @@ class BacktestEngine:
 
         if n_rows >= 2:
             approx_delta = df.index[1] - df.index[0]
-            self.log.info(
-                "Approximate candle interval for %s: %s",
-                self.data_cfg.symbol,
-                approx_delta,
-            )
+            self.log.info("Approximate candle interval for %s: %s", self.data_cfg.symbol, approx_delta)
 
         # ------------------------------------------------------------------
         # Enrich with technical indicators (ATR/EMA/RSI)
@@ -277,8 +423,6 @@ class BacktestEngine:
 
         return df
 
-
-
     def _to_candles(self, df: pd.DataFrame) -> List[Candle]:
         """
         Convert OHLCV(+indicator) DataFrame (datetime index + columns
@@ -292,16 +436,13 @@ class BacktestEngine:
         append = candles.append
 
         base_cols = {"Open", "High", "Low", "Close", "Volume"}
-        # Everything else (ATR_*, EMA_*, RSI_* etc.) is treated as "extra".
         extra_cols = [c for c in df.columns if c not in base_cols]
 
-        # This yields tuples with attributes accessible by column name
         for row in df.itertuples(index=True, name="Row"):
             extras = {col: getattr(row, col) for col in extra_cols}
-
             append(
                 Candle(
-                    timestamp=row.Index,  # index used as timestamp
+                    timestamp=row.Index,
                     open=row.Open,
                     high=row.High,
                     low=row.Low,
@@ -312,7 +453,6 @@ class BacktestEngine:
             )
 
         return candles
-
 
     # ----------------------------------------------------------------
     # Fill simulation
@@ -355,7 +495,8 @@ class BacktestEngine:
                     price=fill_price,
                     qty=order.qty,
                     filled_at=candle.timestamp,
-                    position_id=None,  # set in _apply_fill if you want
+                    client_tag=order.client_tag,   # IMPORTANT for grid mapping
+                    position_id=None,
                 )
                 filled.append(fill)
             else:
@@ -375,7 +516,6 @@ class BacktestEngine:
           - SELL closes the oldest still-open LONG position (FIFO) of same symbol.
         """
         if event.side == Side.BUY:
-            # Create a new LONG position
             pos_id = str(uuid4())
             pos = Position(
                 id=pos_id,
@@ -390,7 +530,6 @@ class BacktestEngine:
             )
             self._open_positions[pos_id] = pos
 
-            # Deduct cost + fee from cash
             notional = event.price * event.qty
             old_cash = self.account.cash_balance
             self.account.cash_balance -= notional + fee
@@ -406,24 +545,20 @@ class BacktestEngine:
             )
 
         elif event.side == Side.SELL:
-            # Close the oldest open LONG position for this symbol (naive FIFO)
             open_positions = [
                 p
                 for p in self._open_positions.values()
                 if p.symbol == event.symbol and p.side == PositionSide.LONG and p.is_open
             ]
             if not open_positions:
-                # Nothing to close – in grid spot trading this shouldn't happen
                 self.log.debug(
                     "SELL fill with no open LONG position for symbol=%s. Ignoring.",
                     event.symbol,
                 )
                 return
 
-            # FIFO: earliest opened
             pos = sorted(open_positions, key=lambda p: p.opened_at)[0]
 
-            # For MVP assume qty == pos.size (no partials)
             notional = event.price * event.qty
             gross_pnl = (event.price - pos.entry_price) * event.qty
             total_fee = fee + pos.fees_paid
@@ -431,7 +566,6 @@ class BacktestEngine:
             pos.closed_at = event.filled_at
             pos.realized_pnl = gross_pnl - total_fee
 
-            # Credit cash minus this side's fee
             old_cash = self.account.cash_balance
             self.account.cash_balance += notional - fee
 
@@ -468,8 +602,7 @@ class BacktestEngine:
                 invested_cost += pos.entry_price * pos.size
                 market_value += last_price * pos.size
             elif pos.side == PositionSide.SHORT:
-                # For shorts you might define cost/market differently;
-                # keeping LONG-only for MVP.
+                # LONG-only MVP. Placeholder for later.
                 invested_cost += pos.entry_price * pos.size
                 market_value += (2 * pos.entry_price - last_price) * pos.size  # placeholder
 
@@ -508,9 +641,7 @@ class BacktestEngine:
         self.account.invested_cost = invested_cost
         self.account.total_value = self.account.cash_balance + market_value
 
-        self._equity_curve.append(
-            EquityPoint(timestamp=candle.timestamp, equity=self.account.total_value)
-        )
+        self._equity_curve.append(EquityPoint(timestamp=candle.timestamp, equity=self.account.total_value))
 
         self.log.debug(
             "Equity update @ %s -> cash=%.2f, invested_cost=%.2f, market_value=%.2f, total_value=%.2f",

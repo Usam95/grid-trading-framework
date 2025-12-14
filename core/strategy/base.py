@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from typing import List
 
 from core.models import Candle, AccountState, Order, OrderFilledEvent
-
+from core.engine_actions import EngineAction
 
 class IStrategy(ABC):
     """
@@ -17,12 +17,11 @@ class IStrategy(ABC):
     """
 
     @abstractmethod
-    def on_candle(self, candle: Candle, account: AccountState) -> List[Order]:
+    def on_candle(self, candle: Candle, account: AccountState) -> List[EngineAction]:
         """
         Called once per candle.
 
-        Should return zero or more new Orders to be submitted to the engine.
-        The engine will handle risk, fills and position accounting.
+    	Should return zero or more EngineActions for the engine to process.
         """
         raise NotImplementedError
 
@@ -40,7 +39,7 @@ class BaseStrategy(IStrategy):
     Optional base class with default no-op implementations.
     """
 
-    def on_candle(self, candle: Candle, account: AccountState) -> List[Order]:
+    def on_candle(self, candle: Candle, account: AccountState) -> List[EngineAction]:
         return []
 
     def on_order_filled(self, event: OrderFilledEvent) -> None:

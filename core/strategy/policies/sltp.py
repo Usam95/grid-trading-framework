@@ -5,108 +5,110 @@ from dataclasses import dataclass
 from typing import Optional
 
 from core.models import Candle
+from infra.indicators import atr_key
 
 
 @dataclass
-class SlTpPolicy:
+class SLTPPolicy:
     """
-    Stop-loss / take-profit policy for LONG positions.
+    Global stop-loss / take-profit policy for DynamicGridStrategy.
 
-    You can choose between percent-based and ATR-based distances:
+    It works like this:
+      - On the first candle, it remembers a base_price (current close).
+      - It computes stop_loss_price / take_profit_price using either:
+          * percent: base_price * (1 ± pct)
+          * ATR:     base_price ± atr_mult * ATR(period)
+      - On each subsequent candle, it checks:
+          * if Low <= stop_loss_price -> "stop_loss"
+          * if High >= take_profit_price -> "take_profit"
 
-      stop_loss_type:
-        - "percent": SL = entry_price * (1 - stop_loss_pct)
-        - "atr":     SL = entry_price - ATR * stop_loss_atr_mult
-
-      take_profit_type:
-        - "percent": TP = entry_price * (1 + take_profit_pct)
-        - "atr":     TP = entry_price + ATR * take_profit_atr_mult
-
-    ATR is taken from candle.extra[atr_key] if needed.
+    The 'cfg' object is expected to have attributes:
+      use_stop_loss, stop_loss_type, stop_loss_pct, stop_loss_atr_mult,
+      use_take_profit, take_profit_type, take_profit_pct, take_profit_atr_mult,
+      sltp_atr_period (int)
     """
-    # Global ATR column name to use for ATR-based SL/TP
-    atr_key: Optional[str] = None
 
-    # Stop-loss config
-    use_stop_loss: bool = False
-    stop_loss_type: str = "percent"         # "percent" | "atr"
-    stop_loss_pct: Optional[float] = None   # e.g. 0.2 = 20%
-    stop_loss_atr_mult: Optional[float] = None
+    cfg: object                  # DynamicGridConfig or compatible
+    sltp_atr_period: int = 14    # ATR period to use for SL/TP
 
-    # Take-profit config
-    use_take_profit: bool = False
-    take_profit_type: str = "percent"       # "percent" | "atr"
-    take_profit_pct: Optional[float] = None
-    take_profit_atr_mult: Optional[float] = None
+    base_price: Optional[float] = None
+    stop_loss_price: Optional[float] = None
+    take_profit_price: Optional[float] = None
 
     # ------------------------------------------------------------------ #
-    # Compute levels at entry time (for a LONG position)
+    # Internal helpers
     # ------------------------------------------------------------------ #
-    def compute_stop_loss(self, entry_price: float, candle: Candle) -> Optional[float]:
-        if not self.use_stop_loss:
+
+    def reset(self) -> None:
+        """
+        Reset internal state to allow re-initialisation (for re-entry later).
+        """
+        self.base_price = None
+        self.stop_loss_price = None
+        self.take_profit_price = None
+
+    def _init_levels_if_needed(self, candle: Candle) -> None:
+        if self.base_price is not None:
+            return
+
+        # Base reference price - simplest: current close
+        self.base_price = candle.close
+
+        # Fetch ATR if any of SL/TP uses ATR
+        atr_val = None
+        if (
+            getattr(self.cfg, "stop_loss_type", None) == "atr"
+            or getattr(self.cfg, "take_profit_type", None) == "atr"
+        ):
+            key = atr_key(self.sltp_atr_period)
+            atr_val = candle.extra.get(key)
+
+        # --- STOP LOSS ---
+        if getattr(self.cfg, "use_stop_loss", False):
+            sl_type = getattr(self.cfg, "stop_loss_type", "percent")
+            if sl_type == "percent":
+                pct = getattr(self.cfg, "stop_loss_pct", 0.0)
+                self.stop_loss_price = self.base_price * (1.0 - pct)
+            elif sl_type == "atr" and atr_val is not None:
+                mult = getattr(self.cfg, "stop_loss_atr_mult", 0.0)
+                self.stop_loss_price = self.base_price - mult * atr_val
+
+        # --- TAKE PROFIT ---
+        if getattr(self.cfg, "use_take_profit", False):
+            tp_type = getattr(self.cfg, "take_profit_type", "percent")
+            if tp_type == "percent":
+                pct = getattr(self.cfg, "take_profit_pct", 0.0)
+                self.take_profit_price = self.base_price * (1.0 + pct)
+            elif tp_type == "atr" and atr_val is not None:
+                mult = getattr(self.cfg, "take_profit_atr_mult", 0.0)
+                self.take_profit_price = self.base_price + mult * atr_val
+
+    # ------------------------------------------------------------------ #
+    # Public API
+    # ------------------------------------------------------------------ #
+
+    def check(self, candle: Candle) -> Optional[str]:
+        """
+        Returns:
+          - "stop_loss"   if SL is triggered
+          - "take_profit" if TP is triggered
+          - None          otherwise
+        """
+        use_sl = getattr(self.cfg, "use_stop_loss", False)
+        use_tp = getattr(self.cfg, "use_take_profit", False)
+        if not (use_sl or use_tp):
             return None
 
-        if self.stop_loss_type == "percent":
-            pct = self.stop_loss_pct
-            if pct is None:
-                return None
-            return entry_price * (1.0 - pct)
+        self._init_levels_if_needed(candle)
 
-        if self.stop_loss_type == "atr":
-            if self.atr_key is None or self.stop_loss_atr_mult is None:
-                return None
-            atr = candle.extra.get(self.atr_key)
-            if atr is None:
-                # Warm-up: fallback to percent if available, otherwise no SL
-                if self.stop_loss_pct is not None:
-                    return entry_price * (1.0 - self.stop_loss_pct)
-                return None
-            return entry_price - atr * self.stop_loss_atr_mult
+        # Stop-loss: use Low
+        if use_sl and self.stop_loss_price is not None:
+            if candle.low <= self.stop_loss_price:
+                return "stop_loss"
 
-        raise ValueError(f"Unknown stop_loss_type {self.stop_loss_type!r}")
+        # Take-profit: use High
+        if use_tp and self.take_profit_price is not None:
+            if candle.high >= self.take_profit_price:
+                return "take_profit"
 
-    def compute_take_profit(self, entry_price: float, candle: Candle) -> Optional[float]:
-        if not self.use_take_profit:
-            return None
-
-        if self.take_profit_type == "percent":
-            pct = self.take_profit_pct
-            if pct is None:
-                return None
-            return entry_price * (1.0 + pct)
-
-        if self.take_profit_type == "atr":
-            if self.atr_key is None or self.take_profit_atr_mult is None:
-                return None
-            atr = candle.extra.get(self.atr_key)
-            if atr is None:
-                # Warm-up: fallback to percent if available
-                if self.take_profit_pct is not None:
-                    return entry_price * (1.0 + self.take_profit_pct)
-                return None
-            return entry_price + atr * self.take_profit_atr_mult
-
-        raise ValueError(f"Unknown take_profit_type {self.take_profit_type!r}")
-
-    # ------------------------------------------------------------------ #
-    # Helpers for checking hits (LONG side)
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def sl_hit_long(candle: Candle, sl: Optional[float]) -> bool:
-        """
-        Check if SL was hit for a LONG position within this candle.
-        Conservative rule: we only look at low.
-        """
-        if sl is None:
-            return False
-        return candle.low <= sl
-
-    @staticmethod
-    def tp_hit_long(candle: Candle, tp: Optional[float]) -> bool:
-        """
-        Check if TP was hit for a LONG position within this candle.
-        Conservative rule: we only look at high.
-        """
-        if tp is None:
-            return False
-        return candle.high >= tp
+        return None

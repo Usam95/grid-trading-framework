@@ -183,6 +183,7 @@ class DynamicGridStrategyConfig(StrategyConfigBase):
     spacing_pct: float = Field(0.007, ge=0.0)
     spacing_atr_mult: float = Field(0.5, ge=0.0)
 
+    range_atr_period: int = Field(14, ge=1)
     range_atr_lower_mult: float = Field(3.0, ge=0.0)
     range_atr_upper_mult: float = Field(3.0, ge=0.0)
 
@@ -196,7 +197,9 @@ class DynamicGridStrategyConfig(StrategyConfigBase):
     take_profit_type: Literal["percent", "atr"] = "percent"
     take_profit_pct: float = Field(0.3, ge=0.0)
     take_profit_atr_mult: float = Field(3.0, ge=0.0)
-
+    # NEW: which ATR period to use for SL/TP (must be present in indicators.atr_periods)
+    
+    sltp_atr_period: int = Field(14, ge=1)
     # --- Floating / recentering ---
     recenter_mode: Literal["none", "band_break", "time"] = "none"
     recenter_band_pct: float = Field(0.1, ge=0.0)

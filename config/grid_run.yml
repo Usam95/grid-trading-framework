@@ -53,6 +53,7 @@ engine:
     - max_drawdown_pct
     - win_rate_pct
     - profit_factor
+    - n_trades
 
 strategy:
   kind: "grid.dynamic"
@@ -63,7 +64,7 @@ strategy:
   # Percent-based range around the first candle close
   range_mode: "percent"      # case-insensitive -> GridRangeMode.PERCENT
   spacing: "arithmetic"      # case-insensitive -> GridSpacing.ARITHMETIC
-
+  range_atr_period: 50
   lower_pct: 0.10            # 10% below
   upper_pct: 0.10            # 10% above
 
