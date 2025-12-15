@@ -40,12 +40,30 @@ data:
     rsi_periods: [25]
 
 engine:
-  mode: backtest
   initial_balance: 1000.0
-  trading_fee_pct: 0.0007     # 0.07% per fill
-  slippage_pct: 0.0
-  max_candles: null           # or e.g. 10000
+  initial_base_qty: 0.0
 
+  trading_fee_pct: 0.001
+  slippage_pct: 0.0
+  max_candles: null
+
+  reservations:
+    enabled: true
+
+  constraints:
+    enabled: true
+    insufficient_funds_mode: "resize"   # "skip" or "resize"
+    min_order_qty: 1.0                  # base-asset min qty (engine-side)
+
+  bootstrap:
+    mode: "neutral_split"               # "long_only" | "neutral_split" | "neutral_topup"
+    initial_quote_to_base_pct: 0.50     # only used by neutral_split
+
+    # only used by neutral_topup:
+    target_base_qty: null
+    target_base_value_pct: null
+    max_topup_quote: null
+    
   # Optional: override metrics if you like; these are the defaults
   metrics:
     - net_pnl

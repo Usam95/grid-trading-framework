@@ -1,6 +1,7 @@
 # backtest/engine.py
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import datetime
 from typing import Dict, List, Optional
 from uuid import uuid4
@@ -30,6 +31,11 @@ from core.results.models import BacktestResult, EquityPoint
 from core.results.trade_builder import TradeBuilder
 from core.results.metrics import MetricRegistry, create_default_metric_registry
 
+# NEW: execution-layer policies
+from core.execution.bootstrap import bootstrap_portfolio
+from core.execution.constraints import OrderConstraintPolicy
+from core.execution.reservations import ReservationBook
+
 
 class BacktestEngine:
     """
@@ -46,6 +52,15 @@ class BacktestEngine:
       - The engine is the single authority for assigning Order.id.
       - Order IDs are assigned as SYMBOL-N (e.g. "XRPUSDT-1").
       - client_tag is propagated into OrderFilledEvent so strategies can map fills.
+
+    NEW FUNCTIONALITY LAYER (clean + modular):
+      ✅ applies bootstrap once (long_only / neutral_split / neutral_topup)
+      ✅ uses constraints at order acceptance (skip / resize + min_order_qty)
+      ✅ reserves funds (spot-style locking) on accepted orders
+      ✅ releases reservations on fill/cancel
+      ✅ supports SELL resize correctly (partial closes + multi-lot closes)
+      ✅ computes correct initial_balance including bootstrap + initial assets
+      ✅ stores debug info in result.extra["bootstrap"]
     """
 
     def __init__(
@@ -74,7 +89,7 @@ class BacktestEngine:
 
         # Open orders/positions for the run
         self._open_orders: Dict[str, Order] = {}          # order_id -> Order
-        self._open_positions: Dict[str, Position] = {}    # position_id -> Position
+        self._open_positions: Dict[str, Position] = {}    # position_id -> Position (may contain closed positions too)
         self._equity_curve: List[EquityPoint] = []
         self._all_orders: List[Order] = []
 
@@ -84,6 +99,22 @@ class BacktestEngine:
         # Order ID sequencing (engine-owned):
         # Each symbol has its own counter, producing IDs like: XRPUSDT-1, XRPUSDT-2, ...
         self._order_seq_by_symbol: Dict[str, int] = {}
+
+        # NEW: Reservation + Constraint policies
+        self._reservations = ReservationBook(
+            enabled=bool(getattr(self.engine_cfg, "reservations", None) and self.engine_cfg.reservations.enabled),
+            fee_pct=float(self.engine_cfg.trading_fee_pct),
+        )
+        self._constraints = OrderConstraintPolicy(
+            cfg=getattr(self.engine_cfg, "constraints", None) or None,  # policy handles disabled internally
+            fee_pct=float(self.engine_cfg.trading_fee_pct),
+        )
+
+        # NEW: store bootstrap outcome for results
+        self._bootstrap_outcome = None
+
+        # Optional debug trace (off by default; enable by adding engine_cfg.debug_store_reservation_trace=True)
+        self._debug_reservation_trace: List[dict] = []
 
     # ----------------------------------------------------------------
     # Public API
@@ -111,6 +142,28 @@ class BacktestEngine:
             self.data_cfg.symbol,
         )
 
+        if not candles:
+            raise ValueError("No candles loaded - cannot run backtest.")
+
+        # ----------------------------------------------------------------
+        # NEW: Bootstrap once BEFORE the main loop
+        # ----------------------------------------------------------------
+        candle0 = candles[0]
+        self._apply_bootstrap(candle0)
+
+        # NEW: compute correct initial equity (cash + base inventory at start price)
+        self._recompute_equity_unrealized(last_price=candle0.close, symbol=self.data_cfg.symbol)
+        starting_equity = float(self.account.total_value)
+
+        if self._bootstrap_outcome is not None:
+            self.log.info(
+                "Bootstrap applied: mode=%s start_price=%.6f cash_after=%.2f base_inventory=%.6f",
+                getattr(self._bootstrap_outcome, "mode", "unknown"),
+                candle0.close,
+                self.account.cash_balance,
+                self._base_inventory(self.data_cfg.symbol),
+            )
+
         grid_exit_reason: Optional[str] = None
 
         # ----------------------------------------------------------------
@@ -120,6 +173,15 @@ class BacktestEngine:
             # Optional: support max_candles in engine_cfg
             if self.engine_cfg.max_candles is not None and idx >= self.engine_cfg.max_candles:
                 self.log.info("Stopping early due to max_candles=%d", self.engine_cfg.max_candles)
+                break
+
+            # If we already stopped due to grid exit, stop processing candles
+            if grid_exit_reason is not None:
+                self.log.info(
+                    "Stopping backtest early due to grid_exit_reason=%s at %s",
+                    grid_exit_reason,
+                    candle.timestamp,
+                )
                 break
 
             # Strategy decides on new actions based on latest candle + account state
@@ -149,6 +211,7 @@ class BacktestEngine:
                         candle.timestamp,
                     )
 
+                    # NEW: release reservations when canceling
                     self._force_flatten_and_cancel(symbol, candle, reason)
                     grid_exit_reason = reason
 
@@ -167,21 +230,64 @@ class BacktestEngine:
                         )
                         continue
 
+                    # Ensure MARKET orders have a price estimate for constraints/reservations
+                    if order.type == OrderType.MARKET and (order.price is None or order.price <= 0):
+                        order.price = candle.close
+
+                    # Reject obviously invalid order inputs early
+                    if order.qty is None or order.qty <= 0:
+                        self.log.debug("Reject order with non-positive qty: qty=%s tag=%s", order.qty, order.client_tag)
+                        continue
+                    if order.side == Side.BUY and (order.price is None or order.price <= 0):
+                        self.log.debug("Reject BUY with invalid price: price=%s tag=%s", order.price, order.client_tag)
+                        continue
+
+                    # NEW: constraints (skip/resize) computed on AVAILABLE funds (cash/base - reserved)
+                    available_quote = self._available_quote()
+                    available_base = self._available_base(order.symbol)
+
+                    decision = self._constraints.evaluate(
+                        order,
+                        available_quote=available_quote,
+                        available_base=available_base,
+                    )
+
+                    if not decision.accept:
+                        self.log.debug(
+                            "Order rejected by constraints: side=%s price=%s qty=%s reason=%s tag=%s "
+                            "(avail_quote=%.2f avail_base=%.6f reserved_quote=%.2f reserved_base=%.6f)",
+                            order.side.value,
+                            order.price,
+                            order.qty,
+                            decision.reason,
+                            order.client_tag,
+                            available_quote,
+                            available_base,
+                            self._reservations.reserved_quote,
+                            self._reservations.reserved_base,
+                        )
+                        continue
+
                     # Engine is single authority for order IDs:
-                    # always assign/overwrite to ensure deterministic ID scheme.
                     assigned_id = self._assign_order_id(order)
+
+                    # NEW: reserve funds for accepted order (spot-style locking)
+                    self._reservations.reserve(order)
 
                     self._open_orders[order.id] = order
                     self._all_orders.append(order)
 
                     self.log.debug(
-                        "New order accepted: id=%s side=%s price=%.6f qty=%.4f type=%s tag=%s",
+                        "New order accepted: id=%s side=%s price=%.6f qty=%.6f type=%s tag=%s "
+                        "(reserved_quote=%.2f reserved_base=%.6f)",
                         assigned_id,
                         order.side.value,
-                        order.price,
-                        order.qty,
+                        float(order.price or 0.0),
+                        float(order.qty or 0.0),
                         order.type.value,
                         order.client_tag,
+                        self._reservations.reserved_quote,
+                        self._reservations.reserved_base,
                     )
                     continue
 
@@ -199,10 +305,14 @@ class BacktestEngine:
 
             # Apply fills to positions & account state and notify strategy
             for event in filled_events:
+                # NEW: release reservation on fill
+                self._reservations.release(event.order_id)
+
                 fee = event.price * event.qty * self.engine_cfg.trading_fee_pct
 
                 self.log.debug(
-                    "Order fill: order_id=%s side=%s price=%.6f qty=%.4f ts=%s fee=%.6f tag=%s",
+                    "Order fill: order_id=%s side=%s price=%.6f qty=%.6f ts=%s fee=%.6f tag=%s "
+                    "(reserved_quote=%.2f reserved_base=%.6f)",
                     event.order_id,
                     event.side.value,
                     event.price,
@@ -210,6 +320,8 @@ class BacktestEngine:
                     event.filled_at,
                     fee,
                     event.client_tag,
+                    self._reservations.reserved_quote,
+                    self._reservations.reserved_base,
                 )
 
                 # Update positions & account (pass fee explicitly)
@@ -224,14 +336,20 @@ class BacktestEngine:
             # Recompute equity based on open positions at candle close
             self._update_equity(candle)
 
-            # Stop the backtest after a global grid exit
-            if grid_exit_reason is not None:
-                self.log.info(
-                    "Stopping backtest early due to grid_exit_reason=%s at %s",
-                    grid_exit_reason,
-                    candle.timestamp,
+            # Optional debug trace (lightweight; only if explicitly enabled)
+            if bool(getattr(self.engine_cfg, "debug_store_reservation_trace", False)):
+                self._debug_reservation_trace.append(
+                    {
+                        "ts": candle.timestamp,
+                        "cash_balance": float(self.account.cash_balance),
+                        "reserved_quote": float(self._reservations.reserved_quote),
+                        "available_quote": float(self._available_quote()),
+                        "base_total": float(self._base_inventory(self.data_cfg.symbol)),
+                        "reserved_base": float(self._reservations.reserved_base),
+                        "available_base": float(self._available_base(self.data_cfg.symbol)),
+                        "open_orders": len(self._open_orders),
+                    }
                 )
-                break
 
         # ---- After loop: build BacktestResult and compute metrics ----
 
@@ -244,7 +362,8 @@ class BacktestEngine:
             timeframe=getattr(self.data_cfg, "timeframe", "unknown"),
             started_at=started_at,
             finished_at=datetime.now(),
-            initial_balance=self.engine_cfg.initial_balance,
+            # NEW: correct initial balance (equity after bootstrap + initial assets)
+            initial_balance=starting_equity,
             final_equity=final_equity,
             trades=self._trade_builder.get_trades(),
             equity_curve=self._equity_curve,
@@ -257,6 +376,25 @@ class BacktestEngine:
         # Keep positions & raw orders in extra so they’re still accessible
         result.extra["positions"] = list(self._open_positions.values())
         result.extra["raw_orders"] = self._all_orders
+
+        # NEW: store bootstrap outcome
+        if self._bootstrap_outcome is not None:
+            try:
+                result.extra["bootstrap"] = asdict(self._bootstrap_outcome)
+            except Exception:
+                # fallback: store repr if outcome isn't a dataclass for some reason
+                result.extra["bootstrap"] = repr(self._bootstrap_outcome)
+        else:
+            result.extra["bootstrap"] = None
+
+        # NEW: store reservation summary + optional trace
+        result.extra["reservations"] = {
+            "enabled": bool(self._reservations.enabled),
+            "reserved_quote": float(self._reservations.reserved_quote),
+            "reserved_base": float(self._reservations.reserved_base),
+        }
+        if self._debug_reservation_trace:
+            result.extra["reservation_trace"] = self._debug_reservation_trace
 
         # Compute metrics via registry
         metric_names = self.engine_cfg.metrics or None  # None = all registered
@@ -275,6 +413,49 @@ class BacktestEngine:
         )
 
         return result
+
+    # ----------------------------------------------------------------
+    # NEW: Bootstrap integration
+    # ----------------------------------------------------------------
+    def _apply_bootstrap(self, candle0: Candle) -> None:
+        """
+        Apply portfolio bootstrap once before processing candles.
+        This can:
+          - create initial base positions (initial_base_qty)
+          - convert quote -> base (neutral_split)
+          - top-up base inventory to a target (neutral_topup)
+        """
+        cash_ref = {"cash": float(self.account.cash_balance)}
+        self._bootstrap_outcome = bootstrap_portfolio(
+            symbol=self.data_cfg.symbol,
+            candle0=candle0,
+            engine_cfg=self.engine_cfg,
+            positions=self._open_positions,
+            cash_balance_ref=cash_ref,
+        )
+        self.account.cash_balance = float(cash_ref["cash"])
+
+    # ----------------------------------------------------------------
+    # NEW: Available funds helpers (cash/base minus reservations)
+    # ----------------------------------------------------------------
+    def _base_inventory(self, symbol: str) -> float:
+        return sum(
+            p.size
+            for p in self._open_positions.values()
+            if p.symbol == symbol and p.side == PositionSide.LONG and p.is_open
+        )
+
+    def _available_quote(self) -> float:
+        cash = float(self.account.cash_balance)
+        if not self._reservations.enabled:
+            return cash
+        return max(0.0, cash - float(self._reservations.reserved_quote))
+
+    def _available_base(self, symbol: str) -> float:
+        base = float(self._base_inventory(symbol))
+        if not self._reservations.enabled:
+            return base
+        return max(0.0, base - float(self._reservations.reserved_base))
 
     # ----------------------------------------------------------------
     # Order ID assignment
@@ -313,25 +494,33 @@ class BacktestEngine:
 
         Used when a grid strategy sends a GRID_EXIT action
         (global stop-loss / take-profit).
+
+        NEW:
+          - releases reservations for cancelled orders
+          - closes positions using a direct SELL fill event (market @ candle.close)
         """
         # 1) Cancel open orders for this symbol
         remaining: Dict[str, Order] = {}
         for order_id, order in self._open_orders.items():
             if order.symbol != symbol:
                 remaining[order_id] = order
-            else:
-                self.log.info(
-                    "Grid exit %s: cancelling open order id=%s side=%s price=%.6f qty=%.4f tag=%s",
-                    reason,
-                    order_id,
-                    order.side.value,
-                    order.price,
-                    order.qty,
-                    order.client_tag,
-                )
+                continue
+
+            # NEW: release reservation on cancel
+            self._reservations.release(order_id)
+
+            self.log.info(
+                "Grid exit %s: cancelling open order id=%s side=%s price=%.6f qty=%.6f tag=%s",
+                reason,
+                order_id,
+                order.side.value,
+                float(order.price or 0.0),
+                float(order.qty or 0.0),
+                order.client_tag,
+            )
         self._open_orders = remaining
 
-        # 2) Close all open positions for this symbol (LONG-only MVP)
+        # 2) Close all open positions for this symbol (LONG-only)
         for pos_id, pos in list(self._open_positions.items()):
             if pos.symbol != symbol or not pos.is_open:
                 continue
@@ -349,7 +538,7 @@ class BacktestEngine:
             fee = event.price * event.qty * self.engine_cfg.trading_fee_pct
 
             self.log.info(
-                "Grid exit %s: closing position %s at %.6f qty=%.4f fee=%.6f",
+                "Grid exit %s: closing position %s at %.6f qty=%.6f fee=%.6f",
                 reason,
                 pos_id,
                 event.price,
@@ -465,7 +654,7 @@ class BacktestEngine:
         - LIMIT SELL fills if candle.high >= price
         - MARKET orders fill at candle.close immediately
 
-        No partial fills for MVP.
+        No partial fills for MVP (BUT SELL can close partially across positions).
         """
         filled: List[OrderFilledEvent] = []
         remaining_orders: Dict[str, Order] = {}
@@ -477,12 +666,16 @@ class BacktestEngine:
                 fill_price = candle.close
 
             elif order.type == OrderType.LIMIT:
-                if order.side == Side.BUY and candle.low <= order.price:
-                    fill_price = order.price
-                elif order.side == Side.SELL and candle.high >= order.price:
-                    fill_price = order.price
-                else:
+                # guard for invalid limit price
+                if order.price is None or order.price <= 0:
                     fill_price = None
+                else:
+                    if order.side == Side.BUY and candle.low <= order.price:
+                        fill_price = order.price
+                    elif order.side == Side.SELL and candle.high >= order.price:
+                        fill_price = order.price
+                    else:
+                        fill_price = None
             else:
                 # STOP / STOP_LIMIT not handled yet in MVP
                 fill_price = None
@@ -492,8 +685,8 @@ class BacktestEngine:
                     order_id=order.id,
                     symbol=order.symbol,
                     side=order.side,
-                    price=fill_price,
-                    qty=order.qty,
+                    price=float(fill_price),
+                    qty=float(order.qty),
                     filled_at=candle.timestamp,
                     client_tag=order.client_tag,   # IMPORTANT for grid mapping
                     position_id=None,
@@ -511,9 +704,15 @@ class BacktestEngine:
     def _apply_fill(self, event: OrderFilledEvent, fee: float) -> None:
         """
         Update positions & account state given a single fill event.
+
         For MVP:
           - BUY opens a new LONG position (one per fill).
-          - SELL closes the oldest still-open LONG position (FIFO) of same symbol.
+
+        NEW:
+          - SELL supports:
+              * partial closes (qty < position.size)
+              * multi-lot closes (one SELL can close several FIFO positions)
+          - This is required for correct SELL resizing behavior.
         """
         if event.side == Side.BUY:
             pos_id = str(uuid4())
@@ -521,69 +720,133 @@ class BacktestEngine:
                 id=pos_id,
                 symbol=event.symbol,
                 side=PositionSide.LONG,
-                entry_price=event.price,
-                size=event.qty,
+                entry_price=float(event.price),
+                size=float(event.qty),
                 opened_at=event.filled_at,
                 closed_at=None,
                 realized_pnl=0.0,
-                fees_paid=fee,
+                fees_paid=float(fee),
             )
             self._open_positions[pos_id] = pos
 
-            notional = event.price * event.qty
+            notional = float(event.price) * float(event.qty)
             old_cash = self.account.cash_balance
-            self.account.cash_balance -= notional + fee
+            self.account.cash_balance -= notional + float(fee)
 
             self.log.debug(
-                "BUY fill -> opened position %s: size=%.4f entry=%.6f, fee=%.6f; cash %.2f -> %.2f",
+                "BUY fill -> opened position %s: size=%.6f entry=%.6f, fee=%.6f; cash %.2f -> %.2f",
                 pos_id,
-                event.qty,
-                event.price,
-                fee,
+                float(event.qty),
+                float(event.price),
+                float(fee),
                 old_cash,
                 self.account.cash_balance,
             )
 
-        elif event.side == Side.SELL:
-            open_positions = [
-                p
-                for p in self._open_positions.values()
-                if p.symbol == event.symbol and p.side == PositionSide.LONG and p.is_open
-            ]
-            if not open_positions:
-                self.log.debug(
-                    "SELL fill with no open LONG position for symbol=%s. Ignoring.",
-                    event.symbol,
-                )
+            # Recompute equity after fill
+            self._recompute_equity_unrealized(last_price=float(event.price), symbol=event.symbol)
+            return
+
+        # SELL: partial + multi-lot
+        if event.side == Side.SELL:
+            remaining = float(event.qty)
+            if remaining <= 0:
                 return
 
-            pos = sorted(open_positions, key=lambda p: p.opened_at)[0]
+            # Distribute sell-fee per unit so partials get correct fee split
+            sell_fee_total = float(fee)
+            sell_fee_per_unit = sell_fee_total / float(event.qty)
 
-            notional = event.price * event.qty
-            gross_pnl = (event.price - pos.entry_price) * event.qty
-            total_fee = fee + pos.fees_paid
+            while remaining > 1e-12:
+                open_positions = [
+                    p
+                    for p in self._open_positions.values()
+                    if p.symbol == event.symbol and p.side == PositionSide.LONG and p.is_open
+                ]
+                if not open_positions:
+                    self.log.debug(
+                        "SELL fill remaining_qty=%.6f but no open LONG position for symbol=%s. Ignoring remainder.",
+                        remaining,
+                        event.symbol,
+                    )
+                    break
 
-            pos.closed_at = event.filled_at
-            pos.realized_pnl = gross_pnl - total_fee
+                # FIFO: close the oldest open position first
+                pos = sorted(open_positions, key=lambda p: p.opened_at)[0]
 
-            old_cash = self.account.cash_balance
-            self.account.cash_balance += notional - fee
+                close_qty = min(remaining, float(pos.size))
 
-            self.log.debug(
-                "SELL fill -> closed position %s: size=%.4f entry=%.6f exit=%.6f gross_pnl=%.6f total_fee=%.6f realized_pnl=%.6f; cash %.2f -> %.2f",
-                pos.id,
-                pos.size,
-                pos.entry_price,
-                event.price,
-                gross_pnl,
-                total_fee,
-                pos.realized_pnl,
-                old_cash,
-                self.account.cash_balance,
-            )
+                # Split buy fee proportionally for the part being closed
+                buy_fee_part = float(pos.fees_paid) * (close_qty / float(pos.size)) if pos.size > 0 else 0.0
+                sell_fee_part = sell_fee_per_unit * close_qty
 
-        # Recompute total_value & invested_cost from open positions
-        self._recompute_equity_unrealized(last_price=event.price, symbol=event.symbol)
+                notional = float(event.price) * close_qty
+                gross_pnl = (float(event.price) - float(pos.entry_price)) * close_qty
+                realized = gross_pnl - (buy_fee_part + sell_fee_part)
+
+                old_cash = self.account.cash_balance
+                # On SELL: you receive notional, pay the sell fee part
+                self.account.cash_balance += notional - sell_fee_part
+
+                if close_qty >= float(pos.size) - 1e-12:
+                    # Full close
+                    pos.closed_at = event.filled_at
+                    pos.realized_pnl = realized
+                    pos.fees_paid = float(pos.fees_paid) + sell_fee_part
+
+                    self.log.debug(
+                        "SELL fill -> closed position %s FULL: size=%.6f entry=%.6f exit=%.6f gross_pnl=%.6f "
+                        "fee_total=%.6f realized_pnl=%.6f; cash %.2f -> %.2f",
+                        pos.id,
+                        close_qty,
+                        float(pos.entry_price),
+                        float(event.price),
+                        gross_pnl,
+                        (buy_fee_part + sell_fee_part),
+                        realized,
+                        old_cash,
+                        self.account.cash_balance,
+                    )
+                else:
+                    # Partial close: create a closed 'slice' position, reduce the original
+                    closed_id = str(uuid4())
+                    closed = Position(
+                        id=closed_id,
+                        symbol=pos.symbol,
+                        side=pos.side,
+                        entry_price=float(pos.entry_price),
+                        size=close_qty,
+                        opened_at=pos.opened_at,
+                        closed_at=event.filled_at,
+                        realized_pnl=realized,
+                        fees_paid=buy_fee_part + sell_fee_part,
+                    )
+                    self._open_positions[closed_id] = closed
+
+                    # Reduce remaining open part
+                    pos.size = float(pos.size) - close_qty
+                    pos.fees_paid = float(pos.fees_paid) - buy_fee_part
+
+                    self.log.debug(
+                        "SELL fill -> closed position %s PARTIAL: closed_qty=%.6f remaining_qty=%.6f entry=%.6f "
+                        "exit=%.6f gross_pnl=%.6f fee_total=%.6f realized_pnl=%.6f; cash %.2f -> %.2f",
+                        pos.id,
+                        close_qty,
+                        float(pos.size),
+                        float(pos.entry_price),
+                        float(event.price),
+                        gross_pnl,
+                        (buy_fee_part + sell_fee_part),
+                        realized,
+                        old_cash,
+                        self.account.cash_balance,
+                    )
+
+                remaining -= close_qty
+
+            # Recompute equity after sell fill
+            self._recompute_equity_unrealized(last_price=float(event.price), symbol=event.symbol)
+            return
 
     def _recompute_equity_unrealized(self, last_price: float, symbol: str) -> None:
         """
@@ -599,22 +862,22 @@ class BacktestEngine:
                 continue
 
             if pos.side == PositionSide.LONG:
-                invested_cost += pos.entry_price * pos.size
-                market_value += last_price * pos.size
+                invested_cost += float(pos.entry_price) * float(pos.size)
+                market_value += float(last_price) * float(pos.size)
             elif pos.side == PositionSide.SHORT:
                 # LONG-only MVP. Placeholder for later.
-                invested_cost += pos.entry_price * pos.size
-                market_value += (2 * pos.entry_price - last_price) * pos.size  # placeholder
+                invested_cost += float(pos.entry_price) * float(pos.size)
+                market_value += (2 * float(pos.entry_price) - float(last_price)) * float(pos.size)  # placeholder
 
         self.account.invested_cost = invested_cost
-        self.account.total_value = self.account.cash_balance + market_value
+        self.account.total_value = float(self.account.cash_balance) + market_value
 
         self.log.debug(
             "Recompute equity (unrealized) -> cash=%.2f, invested_cost=%.2f, market_value=%.2f, total_value=%.2f",
-            self.account.cash_balance,
-            self.account.invested_cost,
+            float(self.account.cash_balance),
+            float(self.account.invested_cost),
             market_value,
-            self.account.total_value,
+            float(self.account.total_value),
         )
 
     def _update_equity(self, candle: Candle) -> None:
@@ -632,22 +895,22 @@ class BacktestEngine:
                 continue  # single-symbol engine for now
 
             if pos.side == PositionSide.LONG:
-                invested_cost += pos.entry_price * pos.size
-                market_value += candle.close * pos.size
+                invested_cost += float(pos.entry_price) * float(pos.size)
+                market_value += float(candle.close) * float(pos.size)
             elif pos.side == PositionSide.SHORT:
-                invested_cost += pos.entry_price * pos.size
-                market_value += (2 * pos.entry_price - candle.close) * pos.size  # placeholder
+                invested_cost += float(pos.entry_price) * float(pos.size)
+                market_value += (2 * float(pos.entry_price) - float(candle.close)) * float(pos.size)  # placeholder
 
         self.account.invested_cost = invested_cost
-        self.account.total_value = self.account.cash_balance + market_value
+        self.account.total_value = float(self.account.cash_balance) + market_value
 
         self._equity_curve.append(EquityPoint(timestamp=candle.timestamp, equity=self.account.total_value))
 
         self.log.debug(
             "Equity update @ %s -> cash=%.2f, invested_cost=%.2f, market_value=%.2f, total_value=%.2f",
             candle.timestamp,
-            self.account.cash_balance,
-            self.account.invested_cost,
+            float(self.account.cash_balance),
+            float(self.account.invested_cost),
             market_value,
-            self.account.total_value,
+            float(self.account.total_value),
         )

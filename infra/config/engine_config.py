@@ -1,9 +1,10 @@
+# infra/config/engine_config.py
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional, List
+from typing import List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 
 
 class RunMode(str, Enum):
@@ -12,59 +13,103 @@ class RunMode(str, Enum):
     LIVE = "live"
 
 
+class InsufficientFundsMode(str, Enum):
+    SKIP = "skip"
+    RESIZE = "resize"
+
+
+class BootstrapMode(str, Enum):
+    LONG_ONLY = "long_only"
+    NEUTRAL_SPLIT = "neutral_split"
+    NEUTRAL_TOPUP = "neutral_topup"
+
+
+class ConstraintConfig(BaseModel):
+    """
+    Engine-level feasibility checks for PLACE_ORDER actions.
+    """
+    enabled: bool = True
+    insufficient_funds_mode: InsufficientFundsMode = InsufficientFundsMode.SKIP
+    min_order_qty: float = Field(
+        0.0,
+        ge=0.0,
+        description="Minimum base-asset quantity. Orders below are skipped.",
+    )
+
+    @validator("insufficient_funds_mode", pre=True)
+    def _norm_mode(cls, v):
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
+
+
+class ReservationConfig(BaseModel):
+    """
+    Spot-like reservation: lock quote for BUY orders and base qty for SELL orders
+    when orders are accepted (until filled or cancelled).
+    """
+    enabled: bool = True
+
+
+class BootstrapConfig(BaseModel):
+    """
+    Portfolio bootstrap before the first candle is processed.
+
+    - long_only: do nothing (you start with quote cash only, unless initial_base_qty > 0)
+    - neutral_split: convert a percentage of quote cash into base at the first candle close
+    - neutral_topup: ensure base holdings reach a target (qty or value% of equity)
+    """
+    mode: BootstrapMode = BootstrapMode.LONG_ONLY
+
+    # neutral_split
+    initial_quote_to_base_pct: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="For neutral_split: fraction of initial quote cash to convert into base at start.",
+    )
+
+    # neutral_topup
+    target_base_qty: Optional[float] = Field(None, ge=0.0)
+    target_base_value_pct: Optional[float] = Field(None, ge=0.0, le=1.0)
+    max_topup_quote: Optional[float] = Field(None, ge=0.0)
+
+    @validator("mode", pre=True)
+    def _norm_bootstrap_mode(cls, v):
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
+
+
 class BacktestEngineConfig(BaseModel):
     """
-    Generic config for the backtest engine.
+    Configuration for BacktestEngine.
 
-    This will later be extended (slippage model, fill model, etc.).
+    Notes:
+    - initial_balance is quote-currency cash (e.g. USDT/EUR depending on the symbol).
+    - initial_base_qty lets you start with some already-owned base asset for the symbol.
     """
-
     mode: RunMode = RunMode.BACKTEST
 
-    track_equity_curve: bool = Field(
-        True,
-        description="If True, keep full equity curve in memory.",
-    )
+    initial_balance: float = Field(1000.0, ge=0.0)
+    initial_base_qty: float = Field(0.0, ge=0.0)
 
-    initial_balance: float = Field(
-        ...,
-        gt=0,
-        description="Starting cash in quote currency, e.g. 1000.0 USDT.",
-    )
+    trading_fee_pct: float = Field(0.001, ge=0.0)
+    slippage_pct: float = Field(0.0, ge=0.0)
 
-    trading_fee_pct: float = Field(
-        0.0,
-        ge=0.0,
-        description="Fee percentage per side, e.g. 0.0007 = 0.07%.",
-    )
-    slippage_pct: float = Field(
-        0.0,
-        ge=0.0,
-        description="Optional slippage model (% of price) for fills.",
-    )
+    max_candles: Optional[int] = Field(None, ge=1)
 
-    # Optional limits for safety/faster tests
-    max_candles: Optional[int] = Field(
-        None,
-        description="Optionally limit number of candles processed for this run.",
-    )
+    constraints: ConstraintConfig = Field(default_factory=ConstraintConfig)
+    reservations: ReservationConfig = Field(default_factory=ReservationConfig)
+    bootstrap: BootstrapConfig = Field(default_factory=BootstrapConfig)
 
-    # Which metrics to compute via MetricRegistry
-    metrics: List[str] = Field(
-        default_factory=lambda: [
-            "net_pnl",
-            "total_return_pct",
-            "max_drawdown_pct",
-            "win_rate_pct",
-            "profit_factor",
-        ],
-        description=(
-            "List of metric names to compute via the MetricRegistry. "
-            "Names must be registered in "
-            "core.results.metrics.create_default_metric_registry()."
-        ),
-    )
+    metrics: List[str] = Field(default_factory=list)
+
+    @validator("mode", pre=True)
+    def _norm_run_mode(cls, v):
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
 
 
-# Alias for future live engine configs
 EngineConfig = BacktestEngineConfig
