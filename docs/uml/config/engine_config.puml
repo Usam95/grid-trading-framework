@@ -1,0 +1,90 @@
+@startuml
+title Engine Config (BacktestEngineConfig) + execution-layer consumers
+skinparam packageStyle rectangle
+skinparam classAttributeIconSize 0
+
+package "infra.config.engine_config" {
+
+  enum RunMode {
+    backtest
+    live
+  }
+
+  enum InsufficientFundsMode {
+    skip
+    resize
+  }
+
+  enum BootstrapMode {
+    long_only
+    neutral_split
+    neutral_topup
+  }
+
+  class ReservationConfig <<pydantic>> {
+    +enabled: bool
+  }
+
+  class ConstraintConfig <<pydantic>> {
+    +enabled: bool
+    +insufficient_funds_mode: InsufficientFundsMode
+    +min_order_qty: float
+  }
+
+  class BootstrapConfig <<pydantic>> {
+    +mode: BootstrapMode
+    +initial_quote_to_base_pct: Optional[float]
+    +target_base_qty: Optional[float]
+    +target_base_value_pct: Optional[float]
+    +max_topup_quote: Optional[float]
+  }
+
+  class BacktestEngineConfig <<pydantic>> {
+    +mode: RunMode = backtest
+
+    +initial_balance: float
+    +initial_base_qty: float
+
+    +trading_fee_pct: float
+    +slippage_pct: float
+    +max_candles: Optional[int]
+    +metrics: List[str]
+
+    +reservations: ReservationConfig
+    +constraints: ConstraintConfig
+    +bootstrap: BootstrapConfig
+  }
+
+  class EngineConfig <<alias>>
+  EngineConfig ..> BacktestEngineConfig : alias
+  BacktestEngineConfig *-- ReservationConfig
+  BacktestEngineConfig *-- ConstraintConfig
+  BacktestEngineConfig *-- BootstrapConfig
+}
+
+package "core.execution" {
+  class ReservationBook {
+    +enabled: bool
+    +fee_pct: float
+  }
+
+  class OrderConstraintPolicy {
+    +cfg: Optional[ConstraintConfig]
+    +fee_pct: float
+  }
+
+  class "bootstrap_portfolio" <<function>> {
+    +bootstrap_portfolio(engine_cfg: BacktestEngineConfig, ...)
+  }
+}
+
+package "backtest" {
+  class BacktestEngine
+}
+
+BacktestEngine ..> BacktestEngineConfig : uses
+BacktestEngine ..> ReservationBook : creates\n(from engine_cfg.reservations.enabled)
+BacktestEngine ..> OrderConstraintPolicy : creates\n(from engine_cfg.constraints)
+BacktestEngine ..> "bootstrap_portfolio" : calls\n(using engine_cfg.bootstrap/mode)
+OrderConstraintPolicy ..> ConstraintConfig : reads
+@enduml

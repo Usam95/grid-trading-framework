@@ -200,11 +200,27 @@ class DynamicGridStrategyConfig(StrategyConfigBase):
     # NEW: which ATR period to use for SL/TP (must be present in indicators.atr_periods)
     
     sltp_atr_period: int = Field(14, ge=1)
+
+
     # --- Floating / recentering ---
-    recenter_mode: Literal["none", "band_break", "time"] = "none"
-    recenter_band_pct: float = Field(0.1, ge=0.0)
-    recenter_atr_mult: float = Field(2.0, ge=0.0)
-    recenter_interval_days: int = Field(30, ge=1)
+    class FloatingGridConfig(BaseModel):
+        enabled: bool = False
+        mode: Literal["band_break", "time"] = "band_break"
+        band_pct: float = Field(0.10, ge=0.0)
+
+        # If true: band width uses ATR * atr_mult, otherwise uses mid * band_pct
+        use_atr_band: bool = True
+        atr_period: Optional[int] = Field(
+            None, ge=1,
+            description="ATR period for band sizing; if null, reuse range_atr_period."
+        )
+        atr_mult: float = Field(2.0, ge=0.0)
+
+        # used only when mode == "time"
+        interval_days: int = Field(30, ge=1)
+
+    floating_grid: FloatingGridConfig = Field(default_factory=FloatingGridConfig)
+
 
     # --- Trend filters ---
     use_rsi_filter: bool = False

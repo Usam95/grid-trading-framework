@@ -216,8 +216,10 @@ class SimpleGridStrategy(BaseStrategy):
         return order
 
     def _seed_initial_orders(self, start_price: float) -> List[Order]:
+        import bisect
         prices = [lvl.price for lvl in self._grid_levels]
-        k = max(i for i, p in enumerate(prices) if p < start_price)
+        # k = index of last grid price strictly below start_price
+        k = bisect.bisect_left(prices, start_price) - 1
 
         orders: List[Order] = []
 

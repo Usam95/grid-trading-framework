@@ -1,0 +1,393 @@
+@startuml
+title Backtester – Configuration Object Model (Monster Diagram)
+
+left to right direction
+skinparam linetype ortho
+skinparam classAttributeIconSize 0
+hide circle
+
+' ============================================================
+' infra.config (Pydantic models loaded from YAML/JSON)
+' ============================================================
+package "infra.config (Pydantic)" as INFRA {
+
+  class RunConfig {
+    +name: str
+    +description: Optional[str]
+    +mode: RunMode
+    --
+    +data: DataConfig
+    +engine: EngineConfig
+    +strategy: StrategyConfig
+    +logging: LoggingConfig
+    +research: Optional[GridResearchConfig]
+  }
+
+  ' ----------------------- Engine ----------------------------
+  enum RunMode {
+    BACKTEST
+    PAPER
+    LIVE
+  }
+
+  enum InsufficientFundsMode {
+    SKIP
+    RESIZE
+  }
+
+  enum BootstrapMode {
+    LONG_ONLY
+    NEUTRAL_SPLIT
+    NEUTRAL_TOPUP
+  }
+
+  class BacktestEngineConfig <<EngineConfig alias>> {
+    +mode: RunMode
+    +initial_balance: float
+    +initial_base_qty: float
+    +trading_fee_pct: float
+    +slippage_pct: float
+    +max_candles: Optional[int]
+    --
+    +constraints: ConstraintConfig
+    +reservations: ReservationConfig
+    +bootstrap: BootstrapConfig
+    +metrics: List[str]
+  }
+
+  class ConstraintConfig {
+    +enabled: bool
+    +insufficient_funds_mode: InsufficientFundsMode
+    +min_order_qty: float
+  }
+
+  class ReservationConfig {
+    +enabled: bool
+  }
+
+  class BootstrapConfig {
+    +mode: BootstrapMode
+    --
+    +initial_quote_to_base_pct: float
+    +target_base_qty: Optional[float]
+    +target_base_value_pct: Optional[float]
+    +max_topup_quote: Optional[float]
+  }
+
+  note right of BacktestEngineConfig
+    EngineConfig is an alias of BacktestEngineConfig in infra/config/engine_config.py
+  end note
+
+  ' ------------------------ Data -----------------------------
+  class DataSplitConfig {
+    +mode: Literal["ratio","date"]
+    +train_ratio: float
+    +split_date: Optional[datetime]
+  }
+
+  class IndicatorConfig {
+    +compute_atr: bool
+    +atr_periods: List[int]
+    +compute_ema: bool
+    +ema_periods: List[int]
+    +compute_rsi: bool
+    +rsi_periods: List[int]
+  }
+
+  class LocalDataConfig <<DataConfig alias>> {
+    +source: Literal["local"]
+    +symbol: str
+    +timeframe: str
+    +start: Optional[datetime]
+    +end: Optional[datetime]
+    +root: Path
+    +research_timeframes: List[str]
+    --
+    +split: DataSplitConfig
+    +indicators: IndicatorConfig
+  }
+
+  note right of LocalDataConfig
+    DataConfig is currently an alias of LocalDataConfig (no Union yet).
+  end note
+
+  ' ----------------------- Logging ---------------------------
+  class LoggingConfig {
+    +name: str
+    +level: str
+    +log_dir: str
+    +to_console: bool
+    +to_file: bool
+  }
+
+  ' ---------------------- Strategy ---------------------------
+  class StrategyConfigBase {
+    +kind: str
+  }
+
+  enum GridRangeMode {
+    PERCENT
+    ABSOLUTE
+  }
+
+  enum GridSpacing {
+    ARITHMETIC
+    GEOMETRIC
+  }
+
+  class GridStrategyConfig {
+    +kind: "grid.simple"
+    +symbol: str
+    +base_order_size: float
+    +n_levels: int
+    --
+    +lower_pct: Optional[float]
+    +upper_pct: Optional[float]
+    +lower_price: Optional[float]
+    +upper_price: Optional[float]
+    +range_mode: GridRangeMode
+    +spacing: GridSpacing
+  }
+
+  class DynamicGridStrategyConfig {
+    +kind: "grid.dynamic"
+    +symbol: str
+    +base_order_size: float
+    +n_levels: int
+    --
+    +lower_pct: Optional[float]
+    +upper_pct: Optional[float]
+    +lower_price: Optional[float]
+    +upper_price: Optional[float]
+    +range_mode: GridRangeMode
+    +spacing: GridSpacing
+    --
+    ' volatility awareness
+    +spacing_mode: Literal["percent","atr"]
+    +spacing_pct: float
+    +spacing_atr_mult: float
+    +range_atr_period: int
+    +range_atr_lower_mult: float
+    +range_atr_upper_mult: float
+    --
+    ' SL/TP
+    +use_stop_loss: bool
+    +stop_loss_type: Literal["percent","atr"]
+    +stop_loss_pct: float
+    +stop_loss_atr_mult: float
+    +use_take_profit: bool
+    +take_profit_type: Literal["percent","atr"]
+    +take_profit_pct: float
+    +take_profit_atr_mult: float
+    +sltp_atr_period: int
+    --
+    ' floating / recenter
+    +recenter_mode: Literal["none","band_break","time"]
+    +recenter_band_pct: float
+    +recenter_atr_mult: float
+    +recenter_interval_days: int
+    --
+    ' filters
+    +use_rsi_filter: bool
+    +rsi_period: int
+    +rsi_min: float
+    +rsi_max: float
+    +use_trend_filter: bool
+    +ema_period: int
+    +max_deviation_pct: float
+  }
+
+  note right of DynamicGridStrategyConfig
+    If your runtime error says this class has no recenter_* fields,
+    you're importing an older module or running stale code.
+  end note
+
+  interface StrategyConfig <<Union>> {
+  }
+  StrategyConfig <|.. GridStrategyConfig
+  StrategyConfig <|.. DynamicGridStrategyConfig
+
+  GridStrategyConfig --|> StrategyConfigBase
+  DynamicGridStrategyConfig --|> StrategyConfigBase
+
+  GridStrategyConfig ..> GridRangeMode
+  GridStrategyConfig ..> GridSpacing
+  DynamicGridStrategyConfig ..> GridRangeMode
+  DynamicGridStrategyConfig ..> GridSpacing
+
+  ' ---------------------- Research ---------------------------
+  class GridParamGridConfig {
+    +base_order_size: List[float]
+    +n_levels: List[int]
+    +lower_pct: List[float]
+    +upper_pct: List[float]
+    +lower_price: List[float]
+    +upper_price: List[float]
+    +range_mode: List[GridRangeMode]
+    +spacing: List[GridSpacing]
+    +is_empty(): bool
+  }
+
+  class GridResearchConfig {
+    +enabled: bool
+    +max_runs: Optional[int]
+    +primary_metric: str
+    --
+    +param_grid: GridParamGridConfig
+  }
+
+  ' --------------------- Aggregations ------------------------
+  RunConfig *-- BacktestEngineConfig : engine
+  RunConfig *-- LocalDataConfig : data
+  RunConfig *-- LoggingConfig : logging
+  RunConfig o-- GridResearchConfig : research (optional)
+  RunConfig *-- StrategyConfig : strategy
+
+  BacktestEngineConfig *-- ConstraintConfig : constraints
+  BacktestEngineConfig *-- ReservationConfig : reservations
+  BacktestEngineConfig *-- BootstrapConfig : bootstrap
+
+  LocalDataConfig *-- DataSplitConfig : split
+  LocalDataConfig *-- IndicatorConfig : indicators
+  GridResearchConfig *-- GridParamGridConfig : param_grid
+}
+
+' ============================================================
+' infra.config_loader (module/function that creates RunConfig)
+' ============================================================
+package "infra.config_loader" as LOADER {
+  class ConfigLoader <<module>> {
+    +load_run_config(path: str) : RunConfig
+  }
+  ConfigLoader ..> INFRA.RunConfig : returns
+}
+
+' ============================================================
+' core.strategy runtime configs (dataclasses used by strategies)
+' ============================================================
+package "core.strategy (runtime configs)" as CORECFG {
+
+  class GridConfig <<dataclass>> {
+    +symbol: str
+    +base_order_size: float
+    +n_levels: int
+    +lower_pct: Optional[float]
+    +upper_pct: Optional[float]
+    +range_mode: GridRangeMode
+    +lower_price: Optional[float]
+    +upper_price: Optional[float]
+    +spacing: GridSpacing
+  }
+
+  class DynamicGridConfig <<dataclass>> {
+    ' inherits GridConfig
+    --
+    +spacing_mode: str
+    +spacing_pct: float
+    +spacing_atr_mult: float
+    +range_atr_period: int
+    +range_atr_lower_mult: float
+    +range_atr_upper_mult: float
+    --
+    +use_stop_loss: bool
+    +stop_loss_type: str
+    +stop_loss_pct: float
+    +stop_loss_atr_mult: float
+    +use_take_profit: bool
+    +take_profit_type: str
+    +take_profit_pct: float
+    +take_profit_atr_mult: float
+    +sltp_atr_period: int
+    --
+    +recenter_mode: str
+    +recenter_band_pct: float
+    +recenter_atr_mult: float
+    +recenter_interval_days: int
+    --
+    +use_rsi_filter: bool
+    +rsi_period: int
+    +rsi_min: float
+    +rsi_max: float
+    +use_trend_filter: bool
+    +ema_period: int
+    +max_deviation_pct: float
+  }
+
+  DynamicGridConfig --|> GridConfig
+}
+
+' ============================================================
+' core.strategy strategies consume runtime configs
+' ============================================================
+package "core.strategy (strategies)" as STRAT {
+  class SimpleGridStrategy {
+    +__init__(config: GridConfig)
+  }
+  class DynamicGridStrategy {
+    +__init__(config: DynamicGridConfig)
+  }
+
+  SimpleGridStrategy ..> CORECFG.GridConfig
+  DynamicGridStrategy ..> CORECFG.DynamicGridConfig
+}
+
+' ============================================================
+' backtest engine consumes EngineConfig/DataConfig and a Strategy
+' ============================================================
+package "backtest" as BT {
+  class BacktestEngine {
+    +__init__(engine_cfg: EngineConfig,\n data_cfg: DataConfig,\n strategy: BaseStrategy,\n data_source: LocalFileDataSource,\n metric_registry: MetricRegistry)
+  }
+  BacktestEngine ..> INFRA.BacktestEngineConfig
+  BacktestEngine ..> INFRA.LocalDataConfig
+  BacktestEngine ..> STRAT.SimpleGridStrategy
+  BacktestEngine ..> STRAT.DynamicGridStrategy
+}
+
+' ============================================================
+' Apps: build runtime configs from Pydantic configs
+' ============================================================
+package "app" as APP {
+
+  class SimpleGridBacktestApp <<module>> {
+    +main(config_path: str)
+  }
+
+  class GridResearchApp <<module>> {
+    +main(...)
+  }
+
+  SimpleGridBacktestApp ..> LOADER.ConfigLoader : calls load_run_config()
+  SimpleGridBacktestApp ..> INFRA.RunConfig : consumes
+  SimpleGridBacktestApp ..> INFRA.GridStrategyConfig : reads
+  SimpleGridBacktestApp ..> INFRA.DynamicGridStrategyConfig : reads
+  SimpleGridBacktestApp ..> CORECFG.GridConfig : creates
+  SimpleGridBacktestApp ..> CORECFG.DynamicGridConfig : creates
+  SimpleGridBacktestApp ..> STRAT.SimpleGridStrategy : creates
+  SimpleGridBacktestApp ..> STRAT.DynamicGridStrategy : creates
+  SimpleGridBacktestApp ..> BT.BacktestEngine : creates
+
+  GridResearchApp ..> LOADER.ConfigLoader : calls load_run_config()
+  GridResearchApp ..> INFRA.RunConfig : consumes
+  GridResearchApp ..> INFRA.GridResearchConfig : consumes
+  GridResearchApp ..> INFRA.GridParamGridConfig : consumes
+}
+
+' ============================================================
+' Research runner: consumes research config and builds many runs
+' ============================================================
+package "core.research" as RSRCH {
+  class GridResearchRunner {
+    +__init__(run_cfg: RunConfig)
+    +run() : GridResearchSummary
+  }
+  GridResearchRunner ..> INFRA.RunConfig
+  GridResearchRunner ..> INFRA.GridResearchConfig
+  GridResearchRunner ..> INFRA.GridParamGridConfig
+  GridResearchRunner ..> INFRA.DataSplitConfig : uses data.split
+  GridResearchRunner ..> CORECFG.GridConfig : creates per combo (conceptually)
+  GridResearchRunner ..> STRAT.SimpleGridStrategy : runs per combo (conceptually)
+  GridResearchRunner ..> BT.BacktestEngine : runs many times (conceptually)
+}
+
+@enduml

@@ -96,6 +96,7 @@ def save_backtest_result(result: BacktestResult, base_dir: Path | str = "results
         "initial_equity": result.initial_equity,
         "final_equity": result.final_equity,
         "metrics": result.metrics,
+        "benchmark_buy_hold": result.extra.get("benchmark_buy_hold"),
     }
 
     summary_serializable = _to_serializable(summary, FLOAT_DECIMALS)

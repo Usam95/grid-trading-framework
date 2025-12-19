@@ -72,6 +72,7 @@ def main(config_path: str = "config/grid_run.yml") -> None:
 
     elif isinstance(strat_cfg, DynamicGridStrategyConfig):
         # Dynamic / advanced grid
+        fg = strat_cfg.floating_grid  # <- NEW nested block
         dyn_cfg = DynamicGridConfig(
             symbol=strat_cfg.symbol,
             base_order_size=strat_cfg.base_order_size,
@@ -97,10 +98,15 @@ def main(config_path: str = "config/grid_run.yml") -> None:
             take_profit_pct=strat_cfg.take_profit_pct,
             take_profit_atr_mult=strat_cfg.take_profit_atr_mult,
             sltp_atr_period=strat_cfg.sltp_atr_period, 
-            recenter_mode=strat_cfg.recenter_mode,
-            recenter_band_pct=strat_cfg.recenter_band_pct,
-            recenter_atr_mult=strat_cfg.recenter_atr_mult,
-            recenter_interval_days=strat_cfg.recenter_interval_days,
+            floating_grid=DynamicGridConfig.FloatingGridConfig(
+                enabled=fg.enabled,
+                mode=fg.mode,
+                band_pct=fg.band_pct,
+                use_atr_band=fg.use_atr_band,
+                atr_period=fg.atr_period,
+                atr_mult=fg.atr_mult,
+                interval_days=fg.interval_days,
+            ),
             use_rsi_filter=strat_cfg.use_rsi_filter,
             rsi_period=strat_cfg.rsi_period,
             rsi_min=strat_cfg.rsi_min,

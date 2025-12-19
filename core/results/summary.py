@@ -25,6 +25,24 @@ def print_result_summary(result: BacktestResult, logger: Optional[logging.Logger
     out(f"End:       {result.finished_at.isoformat()}")
     out(f"Equity:    {result.initial_equity:.2f} -> {result.final_equity:.2f}")
 
+    bh = result.extra.get("benchmark_buy_hold")
+    if isinstance(bh, dict) and bh.get("enabled"):
+        out("")
+        out("Benchmark (Buy & Hold):")
+        if "error" in bh:
+            out(f"  error: {bh['error']}")
+        else:
+            out(
+                f"  equity: {bh.get('initial_equity', 0.0):.2f} -> {bh.get('final_equity', 0.0):.2f}"
+                f" | return: {bh.get('total_return_pct', 0.0):.2f}%"
+            )
+            # Optional: alpha (absolute)
+            try:
+                alpha = float(result.final_equity) - float(bh.get("final_equity", 0.0))
+                out(f"  alpha (strategy - B&H): {alpha:.2f}")
+            except Exception:
+                pass
+
     if result.metrics:
         out("")
         out("Metrics:")

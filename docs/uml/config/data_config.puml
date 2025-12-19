@@ -1,0 +1,68 @@
+@startuml
+title Data Config (LocalDataConfig) and its consumers
+skinparam packageStyle rectangle
+skinparam classAttributeIconSize 0
+
+package "infra.config.data_config" {
+
+  class DataSplitConfig <<pydantic>> {
+    +mode: Literal["ratio","date"]
+    +train_ratio: float
+    +split_date: Optional[str]
+  }
+
+  class IndicatorConfig <<pydantic>> {
+    +compute_atr: bool
+    +atr_periods: List[int]
+    +compute_ema: bool
+    +ema_periods: List[int]
+    +compute_rsi: bool
+    +rsi_periods: List[int]
+  }
+
+  class LocalDataConfig <<pydantic>> {
+    +source: Literal["local"]
+    +symbol: str
+    +timeframe: str
+    +start: str
+    +end: str
+    +root: str
+    +research_timeframes: List[str]
+    +indicators: IndicatorConfig
+    +split: DataSplitConfig
+  }
+
+  class DataConfig <<alias>>
+  DataConfig ..> LocalDataConfig : alias
+  LocalDataConfig *-- IndicatorConfig
+  LocalDataConfig *-- DataSplitConfig
+}
+
+package "infra.data_source" {
+  class DatasetConfig <<dataclass>> {
+    +symbol: str
+    +start: Optional[str]
+    +end: Optional[str]
+    +timeframe: str
+  }
+
+  class LocalFileDataSource {
+    +load(config: DatasetConfig) : pd.DataFrame
+  }
+}
+
+package "infra.splits" {
+  class "split_train_forward" <<function>> {
+    +split(df, split_cfg: DataSplitConfig)
+  }
+}
+
+package "backtest" {
+  class BacktestEngine
+}
+
+LocalDataConfig ..> DatasetConfig : app maps\n(LocalDataConfig -> DatasetConfig)
+LocalFileDataSource ..> DatasetConfig : uses
+"split_train_forward" ..> DataSplitConfig : uses
+BacktestEngine ..> LocalDataConfig : stores/uses
+@enduml

@@ -30,6 +30,7 @@ from infra.indicators import enrich_indicators
 from core.results.models import BacktestResult, EquityPoint
 from core.results.trade_builder import TradeBuilder
 from core.results.metrics import MetricRegistry, create_default_metric_registry
+from core.results.benchmarks import compute_buy_and_hold_benchmark
 
 # NEW: execution-layer policies
 from core.execution.bootstrap import bootstrap_portfolio
@@ -195,7 +196,7 @@ class BacktestEngine:
                     len(actions),
                 )
 
-            # Handle actions (GRID_EXIT and PLACE_ORDER)
+            # Handle actions (GRID_EXIT, CANCEL_OPEN_ORDERS, PLACE_ORDER)
             for action in actions:
                 # -------------------------------
                 # GRID EXIT (global SL/TP)
@@ -217,6 +218,23 @@ class BacktestEngine:
 
                     # Stop processing further actions on this candle
                     break
+
+                # -------------------------------
+                # CANCEL OPEN ORDERS (no flatten; floating-grid recenter)
+                # -------------------------------
+                if action.type == EngineActionType.CANCEL_OPEN_ORDERS:
+                    symbol = action.symbol or self.data_cfg.symbol
+                    reason = (action.cancel_reason or "unknown").lower()
+
+                    self.log.info(
+                        "Received CANCEL_OPEN_ORDERS action: symbol=%s reason=%s at %s",
+                        symbol,
+                        reason,
+                        candle.timestamp,
+                    )
+
+                    self._cancel_open_orders(symbol, candle, reason, context="Cancel open orders")
+                    continue
 
                 # -------------------------------
                 # PLACE ORDER
@@ -396,6 +414,21 @@ class BacktestEngine:
         if self._debug_reservation_trace:
             result.extra["reservation_trace"] = self._debug_reservation_trace
 
+        # ------------------------------------------------------------
+        # Benchmark: Buy & Hold (simple baseline)
+        # ------------------------------------------------------------
+        try:
+            bh = compute_buy_and_hold_benchmark(
+                initial_quote=float(self.engine_cfg.initial_balance),
+                initial_base=float(getattr(self.engine_cfg, "initial_base_qty", 0.0)),
+                fee_pct=float(self.engine_cfg.trading_fee_pct),
+                candle0=candles[0],
+                candle_last=candles[-1],
+            )
+            result.extra["benchmark_buy_hold"] = bh
+        except Exception as e:
+            result.extra["benchmark_buy_hold"] = {"enabled": True, "error": repr(e)}
+
         # Compute metrics via registry
         metric_names = self.engine_cfg.metrics or None  # None = all registered
         result.metrics = self.metric_registry.compute_all(result, metric_names)
@@ -485,6 +518,32 @@ class BacktestEngine:
         return new_id
 
     # ----------------------------------------------------------------
+    # Cancel open orders (no flatten)
+    # ----------------------------------------------------------------
+    def _cancel_open_orders(self, symbol: str, candle: Candle, reason: str, *, context: str) -> None:
+        """Cancel all open orders for symbol (no position flatten). Releases reservations."""
+        remaining: Dict[str, Order] = {}
+        for order_id, order in self._open_orders.items():
+            if order.symbol != symbol:
+                remaining[order_id] = order
+                continue
+
+            # release reservation on cancel
+            self._reservations.release(order_id)
+
+            self.log.info(
+                "%s %s: cancelling open order id=%s side=%s price=%.6f qty=%.6f tag=%s",
+                context,
+                reason,
+                order_id,
+                order.side.value,
+                float(order.price or 0.0),
+                float(order.qty or 0.0),
+                order.client_tag,
+            )
+        self._open_orders = remaining
+
+    # ----------------------------------------------------------------
     # Forced grid exit (flatten + cancel)
     # ----------------------------------------------------------------
     def _force_flatten_and_cancel(self, symbol: str, candle: Candle, reason: str) -> None:
@@ -499,26 +558,9 @@ class BacktestEngine:
           - releases reservations for cancelled orders
           - closes positions using a direct SELL fill event (market @ candle.close)
         """
+
         # 1) Cancel open orders for this symbol
-        remaining: Dict[str, Order] = {}
-        for order_id, order in self._open_orders.items():
-            if order.symbol != symbol:
-                remaining[order_id] = order
-                continue
-
-            # NEW: release reservation on cancel
-            self._reservations.release(order_id)
-
-            self.log.info(
-                "Grid exit %s: cancelling open order id=%s side=%s price=%.6f qty=%.6f tag=%s",
-                reason,
-                order_id,
-                order.side.value,
-                float(order.price or 0.0),
-                float(order.qty or 0.0),
-                order.client_tag,
-            )
-        self._open_orders = remaining
+        self._cancel_open_orders(symbol, candle, reason, context="Grid exit")
 
         # 2) Close all open positions for this symbol (LONG-only)
         for pos_id, pos in list(self._open_positions.items()):

@@ -61,7 +61,7 @@ class RecenterPolicy:
         Decide whether we should re-center the grid given the current band
         [lower, upper] and the latest candle.
 
-        NOTE: This does *not* mutate internal state. Call `mark_recentred`
+        NOTE: This does *not* mutate internal state. Call `mark_recentered`
         after you actually rebuild the grid.
         """
         if self.mode == "none":
@@ -85,7 +85,7 @@ class RecenterPolicy:
 
         raise ValueError(f"Unknown recenter mode {self.mode!r}")
 
-    def mark_recentred(self, candle: Candle) -> None:
+    def mark_recentered(self, candle: Candle) -> None:
         """
         Call this from the strategy right after you rebuild the grid.
         """

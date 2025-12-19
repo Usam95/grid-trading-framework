@@ -1,0 +1,81 @@
+@startuml
+title Config Overview (RunConfig) + Load Flow
+skinparam packageStyle rectangle
+skinparam classAttributeIconSize 0
+
+package "infra.config (Pydantic models)" {
+
+  enum RunMode {
+    backtest
+    live
+  }
+
+  class RunConfig <<pydantic>> {
+    +name: str
+    +description: Optional[str]
+    +mode: RunMode
+    +data: DataConfig
+    +engine: EngineConfig
+    +strategy: StrategyConfig
+    +logging: LoggingConfig
+    +research: GridResearchConfig
+  }
+
+  class DataConfig <<alias>> {
+    note right
+      Currently: DataConfig = LocalDataConfig
+    end note
+  }
+
+  class EngineConfig <<alias>> {
+    note right
+      Currently: EngineConfig = BacktestEngineConfig
+    end note
+  }
+
+  class StrategyConfig <<union>> {
+    note right
+      StrategyConfig = Union[
+        GridStrategyConfig,
+        DynamicGridStrategyConfig
+      ]
+    end note
+  }
+
+  class LoggingConfig <<pydantic>> {
+    +name: str
+    +level: str
+    +log_dir: str
+    +to_console: bool
+    +to_file: bool
+  }
+
+  class GridResearchConfig <<pydantic>> {
+    +enabled: bool
+    +max_runs: Optional[int]
+    +param_grid: GridParamGridConfig
+    +primary_metric: str
+  }
+}
+
+package "infra (loader)" {
+  class "infra.config_loader.load_run_config" <<function>> {
+    +load_run_config(path: str) : RunConfig
+  }
+}
+
+package "app" {
+  class "app.simple_grid_backtest" <<module>>
+  class "app.grid_research" <<module>>
+}
+
+RunConfig *-- LoggingConfig
+RunConfig *-- GridResearchConfig
+RunConfig o-- DataConfig
+RunConfig o-- EngineConfig
+RunConfig o-- StrategyConfig
+
+"infra.config_loader.load_run_config" ..> RunConfig : creates\n(YAML -> dict -> RunConfig.parse_obj)
+"app.simple_grid_backtest" ..> "infra.config_loader.load_run_config" : calls
+"app.grid_research" ..> "infra.config_loader.load_run_config" : calls
+@enduml

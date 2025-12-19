@@ -1,0 +1,182 @@
+@startuml
+title Strategy Configs (infra) -> Runtime Configs (core) + Floating Grid
+skinparam packageStyle rectangle
+skinparam classAttributeIconSize 0
+
+package "core.strategy.grid_strategy_simple" {
+  enum GridRangeMode {
+    percent
+    absolute
+  }
+
+  enum GridSpacing {
+    arithmetic
+    geometric
+  }
+
+  class GridConfig <<dataclass>> {
+    +symbol: str
+    +base_order_size: float
+    +n_levels: int
+    +lower_pct: Optional[float]
+    +upper_pct: Optional[float]
+    +lower_price: Optional[float]
+    +upper_price: Optional[float]
+    +range_mode: GridRangeMode
+    +spacing: GridSpacing
+  }
+
+  class SimpleGridStrategy
+  SimpleGridStrategy ..> GridConfig : uses
+}
+
+package "core.strategy.grid_strategy_dynamic" {
+  class DynamicGridConfig <<dataclass>> {
+    +spacing_mode: str
+    +spacing_pct: float
+    +spacing_atr_mult: float
+
+    +range_atr_period: int
+    +range_atr_lower_mult: float
+    +range_atr_upper_mult: float
+
+    +use_stop_loss: bool
+    +stop_loss_type: str
+    +stop_loss_pct: float
+    +stop_loss_atr_mult: float
+
+    +use_take_profit: bool
+    +take_profit_type: str
+    +take_profit_pct: float
+    +take_profit_atr_mult: float
+
+    +sltp_atr_period: int
+
+    +floating_grid: FloatingGridConfig
+
+    +use_rsi_filter: bool
+    +rsi_period: int
+    +rsi_min: float
+    +rsi_max: float
+
+    +use_trend_filter: bool
+    +ema_period: int
+    +max_deviation_pct: float
+  }
+
+  class FloatingGridConfig <<dataclass>> {
+    +enabled: bool
+    +mode: str  // none|band_break|time
+    +band_pct: float
+    +use_atr_band: bool
+    +atr_period: int
+    +atr_mult: float
+    +interval_days: int
+  }
+
+  DynamicGridConfig --|> GridConfig
+  DynamicGridConfig *-- FloatingGridConfig
+
+  class DynamicGridStrategy
+  DynamicGridStrategy ..> DynamicGridConfig : uses
+}
+
+package "infra.config.strategy_base" {
+  class StrategyConfigBase <<pydantic>> {
+    +kind: str
+    note right
+      Config.extra = "forbid"
+    end note
+  }
+}
+
+package "infra.config.strategy_grid" {
+  class GridStrategyConfig <<pydantic>> {
+    +kind: "grid.simple"
+    +symbol: str
+    +base_order_size: float
+    +n_levels: int
+    +lower_pct: Optional[float]
+    +upper_pct: Optional[float]
+    +lower_price: Optional[float]
+    +upper_price: Optional[float]
+    +range_mode: GridRangeMode
+    +spacing: GridSpacing
+  }
+
+  class DynamicGridStrategyConfig <<pydantic>> {
+    +kind: "grid.dynamic"
+    +symbol: str
+    +base_order_size: float
+    +n_levels: int
+
+    +lower_pct: Optional[float]
+    +upper_pct: Optional[float]
+    +lower_price: Optional[float]
+    +upper_price: Optional[float]
+    +range_mode: GridRangeMode
+    +spacing: GridSpacing
+
+    +spacing_mode: "percent"|"atr"
+    +spacing_pct: float
+    +spacing_atr_mult: float
+
+    +range_atr_period: int
+    +range_atr_lower_mult: float
+    +range_atr_upper_mult: float
+
+    +use_stop_loss: bool
+    +stop_loss_type: "percent"|"atr"
+    +stop_loss_pct: float
+    +stop_loss_atr_mult: float
+
+    +use_take_profit: bool
+    +take_profit_type: "percent"|"atr"
+    +take_profit_pct: float
+    +take_profit_atr_mult: float
+
+    +sltp_atr_period: int
+
+    +floating_grid: FloatingGridConfig
+    +use_rsi_filter: bool
+    +rsi_period: int
+    +rsi_min: float
+    +rsi_max: float
+    +use_trend_filter: bool
+    +ema_period: int
+    +max_deviation_pct: float
+  }
+
+  class FloatingGridConfig <<pydantic>> {
+    +enabled: bool
+    +mode: "none"|"band_break"|"time"
+    +band_pct: float
+    +use_atr_band: bool
+    +atr_period: int
+    +atr_mult: float
+    +interval_days: int
+  }
+
+  GridStrategyConfig --|> StrategyConfigBase
+  DynamicGridStrategyConfig --|> StrategyConfigBase
+  DynamicGridStrategyConfig *-- FloatingGridConfig
+
+  class StrategyConfig <<union>>
+  StrategyConfig ..> GridStrategyConfig
+  StrategyConfig ..> DynamicGridStrategyConfig
+}
+
+package "app.simple_grid_backtest" {
+  class "build runtime configs" <<module>> {
+    note right
+      Maps:
+        GridStrategyConfig -> GridConfig
+        DynamicGridStrategyConfig -> DynamicGridConfig
+      (including floating_grid mapping)
+    end note
+  }
+}
+
+"build runtime configs" ..> GridConfig : creates
+"build runtime configs" ..> DynamicGridConfig : creates
+@enduml

@@ -39,7 +39,9 @@ DEFAULT_EXCLUDED_DIRS = {
     ".terraform",
     "tests", 
     "output",
-    "create_project_snapshot.py"
+    "create_project_snapshot.py",
+    "nlohmann",
+    "docs"
 }
 
 DEFAULT_INCLUDED_EXTENSIONS = {
@@ -58,9 +60,13 @@ DEFAULT_INCLUDED_EXTENSIONS = {
     ".bat",
     ".dockerfile",
     ".Dockerfile",
+    ".h", 
+    ".hpp",
+    ".c",
+    ".cpp",
+    "CMakeLists.txt",
+    ".arxml"
 }
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Create a single snapshot file containing all project sources."
