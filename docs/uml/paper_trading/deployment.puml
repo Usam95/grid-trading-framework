@@ -1,0 +1,65 @@
+@startuml
+title WeaponLiveTrading - Deployment Diagram (Azure + Terraform)
+
+skinparam packageStyle rectangle
+
+node "Developer Machine" as Dev {
+  artifact "Git Repo\n(GridTrading)" as Repo
+  artifact "Dockerfile\n+ image build" as Docker
+}
+
+node "CI/CD (GitHub Actions / Azure DevOps)" as CICD {
+  artifact "Build Pipeline" as Build
+  artifact "Terraform Pipeline" as TfPipe
+}
+
+cloud "Azure Subscription" as Azure {
+  node "Azure Container Registry (ACR)" as ACR
+  node "Azure Container Instance (ACI)" as ACI {
+    node "Container:\nweapon-live-trader" as Container {
+      artifact "app/live_trade.py\n+ WeaponLiveTrading" as App
+      artifact "Logs (stdout + file)" as Logs
+      artifact "Live Results\n(fills/orders/equity/events)" as Results
+    }
+  }
+
+  node "Azure Key Vault" as KV
+  node "Azure Storage" as Storage {
+    artifact "Azure Files / Blob\nresults volume" as Vol
+  }
+  node "Azure Monitor / Log Analytics" as Monitor
+  node "Virtual Network (optional)" as VNet
+  node "NAT Gateway (optional)\nstatic outbound IP" as NAT
+}
+
+Dev --> CICD : push commits/tags
+CICD --> ACR : build & push container image
+
+TfPipe --> Azure : terraform apply
+TfPipe --> ACI : create container group\n(image, env, volume)
+TfPipe --> KV : create secrets\n(API key/secret)
+TfPipe --> Storage : create share/container\nfor results/logs
+TfPipe --> Monitor : diagnostics settings (optional)
+
+ACI --> KV : Managed Identity\nget secrets at runtime
+ACI --> Storage : mount volume\n/results + /logs
+
+ACI --> Monitor : send stdout logs\n(optional)
+VNet --> NAT : egress via NAT (optional)
+ACI --> VNet : join subnet (optional)
+
+note right of KV
+Secrets:
+- BINANCE_API_KEY
+- BINANCE_API_SECRET
+Testnet + Prod separated
+end note
+
+note right of Container
+Run modes:
+- PAPER => Spot Testnet endpoints
+- LIVE  => Prod endpoints
+Same runtime codepath
+end note
+
+@enduml

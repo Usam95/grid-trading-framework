@@ -1,0 +1,38 @@
+name: "xrp_live_phase_a"
+description: "Phase A: stream closed candles from Binance WS and log them."
+
+mode: paper   # paper => Spot Testnet websocket by default
+
+data:
+  source: binance
+  symbol: "XRPUSDT"
+  timeframe: "1m"
+  # use_testnet_ws: true   # optional override (defaults to true when mode: paper)
+
+engine:
+  initial_balance: 1000.0
+  initial_base_qty: 0.0
+  trading_fee_pct: 0.001
+  slippage_pct: 0.0
+  max_candles: null
+  reservations:
+    enabled: true
+  constraints:
+    enabled: true
+    insufficient_funds_mode: "skip"
+    min_order_qty: 5.0
+
+strategy:
+  kind: "grid.simple"
+  symbol: "XRPUSDT"
+  base_order_size: 10.0
+  n_levels: 10
+  range_mode: "percent"
+  lower_pct: 0.1
+  upper_pct: 0.1
+  spacing: "arithmetic"
+
+logging:
+  name: "live"
+  level: "INFO"
+  log_dir: "logs"

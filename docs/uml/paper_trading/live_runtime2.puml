@@ -1,0 +1,71 @@
+@startuml
+title WeaponLiveTrading - Sequence Diagram (Simplified, No Parallel Blocks)
+
+actor Operator
+participant "LiveTradingRunner" as Runner
+participant "ConfigLoader" as Cfg
+participant "LoggingSetup" as Log
+participant "SecretsProvider" as Secrets
+participant "Broker" as Broker
+participant "MarketDataFeed" as Feed
+participant "TradingEngine" as Engine
+participant "BaseStrategy" as Strategy
+participant "LiveResultWriter" as Writer
+participant "HealthReporter" as Health
+
+Operator -> Runner: start(container)
+Runner -> Cfg: load RunConfig
+Runner -> Log: init_logging(...)
+Runner -> Writer: start_session(...)
+Runner -> Secrets: init(...)
+
+alt PAPER (Spot Testnet)
+  Runner -> Broker: connect(testnet)
+else LIVE (Prod)
+  Runner -> Broker: connect(prod)
+end
+
+Runner -> Broker: get_snapshot()
+Broker --> Runner: ExchangeSnapshot
+Runner -> Engine: reconcile(snapshot)
+
+Runner -> Feed: start()
+Feed --> Runner: ready
+
+loop for each CLOSED candle
+  Runner -> Feed: next_closed_candle()
+  Feed --> Runner: Candle
+
+  Runner -> Broker: drain_fills()  'poll or fetch recent updates
+  Broker --> Runner: fill events (0..N)
+  loop for each fill
+    Runner -> Engine: on_fill(fill)
+    Runner -> Writer: record_fill(fill, fee)
+  end
+
+  Runner -> Engine: on_candle(candle)
+  Engine -> Strategy: on_candle(candle, account)
+  Strategy --> Engine: actions
+
+  loop for each action
+    alt PLACE_ORDER
+      Engine -> Broker: place_order(order)
+      Broker --> Engine: ack
+      Engine -> Writer: record_order(order)
+    else GRID_EXIT
+      Engine -> Broker: cancel_all()
+      Engine -> Writer: record_event("GRID_EXIT")
+      break
+    end
+  end
+
+  Runner -> Writer: record_equity(...)
+  Runner -> Health: heartbeat()
+end
+
+Operator -> Runner: SIGTERM/SIGINT
+Runner -> Feed: stop()
+Runner -> Broker: stop()
+Runner -> Writer: close()
+
+@enduml

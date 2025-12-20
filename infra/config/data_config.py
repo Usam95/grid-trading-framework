@@ -1,12 +1,15 @@
+# infra\config\data_config.py
 from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Literal, List
+from typing import Optional, Literal, List, Union
 
 from pydantic import BaseModel, Field, validator
 
 from infra.data_source import HIST_DATA_ROOT
+
+from .binance_live_data_config import BinanceLiveDataConfig
 
 
 class DataSplitConfig(BaseModel):
@@ -134,4 +137,4 @@ class LocalDataConfig(BaseModel):
 
 # For now, we only support LocalDataConfig.
 # In the future, you can introduce a Union[LocalDataConfig, BinanceLiveDataConfig, ...].
-DataConfig = LocalDataConfig
+DataConfig = Union[LocalDataConfig, BinanceLiveDataConfig]

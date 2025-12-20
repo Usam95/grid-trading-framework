@@ -17,8 +17,8 @@ data:
 
   # Optional: timeframes that a research/param-search runner could iterate over
   research_timeframes:
-  #  - "5m"
-  #  - "15m"
+    - "5m"
+    - "15m"
     - "30m"
     - "60m"
 
@@ -53,7 +53,7 @@ engine:
   constraints:
     enabled: true
     insufficient_funds_mode: "resize"   # "skip" or "resize"
-    min_order_qty: 1.0                  # base-asset min qty (engine-side)
+    min_order_qty: 10.0                  # base-asset min qty (engine-side)
 
   bootstrap:
     mode: "neutral_split"               # "long_only" | "neutral_split" | "neutral_topup"
@@ -134,12 +134,12 @@ research:
 
   param_grid:
     # lists of candidate values → Cartesian product
-    base_order_size: [10.0, 20.0, 30.0]
-    n_levels: [20, 30, 50, 80]
+    base_order_size: [20.0]
+    n_levels: [20, 30, 50]
 
     # percent-based ranges
-    lower_pct: [0.05, 0.10, 0.15]
-    upper_pct: [0.05, 0.10, 0.15]
+    lower_pct: [0.10, 0.15]
+    upper_pct: [0.10, 0.15]
 
     # absolute ranges (empty = not used)
     lower_price: []

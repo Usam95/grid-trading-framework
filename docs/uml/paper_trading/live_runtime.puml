@@ -1,0 +1,77 @@
+@startuml
+title WeaponLiveTrading - Sequence Diagram (Paper/Testnet + Live)
+
+actor Operator
+participant "app/live_trade.py\nLiveTradingRunner" as Runner
+participant "infra.logging\nLoggingSetup" as Log
+participant "infra.config\nConfigLoader" as Cfg
+participant "infra.secrets\nSecretsProvider" as Secrets
+participant "infra.exchange\nBroker" as Broker
+participant "infra.marketdata\nMarketDataFeed" as Feed
+participant "core.runtime\nTradingEngine" as Engine
+participant "core.strategy\nBaseStrategy" as Strategy
+participant "core.results\nLiveResultWriter" as Writer
+participant "HealthReporter" as Health
+
+Operator -> Runner: start(container)
+Runner -> Cfg: load RunConfig
+Runner -> Log: init_logging(run_name, level, log_dir)
+Runner -> Writer: start_session(meta + config snapshot)
+Runner -> Secrets: init(provider=env|keyvault)
+
+alt RunMode == PAPER (Binance Spot Testnet)
+  Runner -> Broker: connect(env=testnet, keys)
+else RunMode == LIVE (Binance Prod)
+  Runner -> Broker: connect(env=prod, keys)
+end
+
+Runner -> Broker: get_snapshot()
+Broker --> Runner: ExchangeSnapshot(balances, open_orders)
+Runner -> Engine: reconcile(snapshot)
+
+Runner -> Feed: start()
+Feed -> Feed: warmup history (optional)
+Feed --> Runner: ready
+
+par Fill stream
+  Runner -> Broker: stream_fills()
+  loop for each fill event
+    Broker --> Runner: raw fill/update
+    Runner -> Engine: on_fill(mapped OrderFilledEvent)
+    Runner -> Writer: record_fill(fill, fee)
+    Runner -> Writer: record_equity(ts, equity)
+  end
+par Candle loop
+  loop for each CLOSED candle
+    Runner -> Feed: next_closed_candle()
+    Feed --> Runner: Candle(close)
+    Runner -> Engine: on_candle(candle)
+
+    Engine -> Strategy: on_candle(candle, account_state)
+    Strategy --> Engine: actions[EngineAction...]
+
+    loop for each action
+      alt PLACE_ORDER
+        Engine -> Engine: constraints + reservations + risk checks
+        Engine -> Broker: place_order(order)
+        Broker --> Engine: BrokerOrderAck(exchange_order_id)
+        Engine -> Writer: record_order(order, "SUBMITTED")
+      else GRID_EXIT
+        Engine -> Broker: cancel open orders
+        Engine -> Writer: record_event("GRID_EXIT")
+        break
+      end
+    end
+
+    Runner -> Writer: record_event("CANDLE_PROCESSED")
+    Runner -> Health: heartbeat()
+  end
+end
+
+Operator -> Runner: SIGTERM/SIGINT
+Runner -> Feed: stop()
+Runner -> Broker: stop()
+Runner -> Writer: close()
+Runner -> Health: report shutdown
+
+@enduml

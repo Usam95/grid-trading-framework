@@ -1,0 +1,252 @@
+@startuml
+title WeaponLiveTrading - Class Diagram (Paper + Live)
+
+skinparam packageStyle rectangle
+skinparam classAttributeIconSize 0
+
+' =========================
+' Existing (reused) domain
+' =========================
+package "core (existing)" {
+  class Candle
+  class AccountState
+  class Order
+  class OrderFilledEvent
+  enum EngineActionType
+  class EngineAction
+  interface BaseStrategy {
+    +on_candle(candle: Candle, account: AccountState): List<EngineAction>
+    +on_order_filled(ev: OrderFilledEvent): void
+  }
+}
+
+package "core.execution (existing)" {
+  class OrderConstraintPolicy {
+    +evaluate(order: Order, available_quote: float, available_base: float): ConstraintDecision
+  }
+  class ReservationBook {
+    +reserve(order: Order): void
+    +release(order_id: str): void
+    +reserved_quote: float
+    +reserved_base: float
+  }
+  class ConstraintDecision {
+    +accept: bool
+    +resized_order: Order
+    +reason: str
+  }
+}
+
+' =========================
+' WeaponLiveTrading - NEW
+' =========================
+package "WeaponLiveTrading.core.runtime (new)" {
+
+  class LiveTradingRunner {
+    -config: RunConfig
+    -logger: Logger
+    -feed: MarketDataFeed
+    -engine: TradingEngine
+    -writer: LiveResultWriter
+    -health: HealthReporter
+    +run(): void
+    +stop(): void
+  }
+
+  class TradingEngine {
+    -symbol: str
+    -strategy: BaseStrategy
+    -broker: Broker
+    -constraints: OrderConstraintPolicy
+    -reservations: ReservationBook
+    -account: AccountState
+    -open_orders: Map
+    -exit_reason: str
+    +on_candle(candle: Candle): void
+    +on_fill(ev: OrderFilledEvent): void
+    +reconcile(snapshot: ExchangeSnapshot): void
+  }
+
+  class RiskManager {
+    -max_notional: float
+    -max_open_orders: int
+    -daily_loss_limit: float
+    +check_pre_trade(order: Order, account: AccountState): RiskDecision
+    +check_runtime(account: AccountState): RiskDecision
+  }
+
+  class RiskDecision {
+    +allow: bool
+    +reason: str
+  }
+
+  interface LiveResultWriter {
+    +start_session(meta: SessionMeta): void
+    +record_event(ev: RuntimeEvent): void
+    +record_order(order: Order, status: str): void
+    +record_fill(fill: OrderFilledEvent, fee: float): void
+    +record_equity(ts, equity: float): void
+    +close(): void
+  }
+
+  class FileLiveResultWriter implements LiveResultWriter {
+    -base_dir: str
+    -session_dir: str
+  }
+
+  class HealthReporter {
+    +heartbeat(): void
+    +report_error(err): void
+  }
+
+  class RuntimeEvent {
+    +ts
+    +type
+    +payload
+  }
+
+  class SessionMeta {
+    +run_id: str
+    +mode: str
+    +symbol: str
+    +timeframe: str
+    +started_at
+    +config_snapshot_path: str
+  }
+}
+
+package "WeaponLiveTrading.infra.marketdata (new)" {
+
+  interface MarketDataFeed {
+    +start(): void
+    +next_closed_candle(): Candle
+    +stop(): void
+  }
+
+  class BinanceKlineWebSocketFeed implements MarketDataFeed {
+    -symbol: str
+    -interval: str
+    -logger
+    -queue
+    +start(): void
+    +next_closed_candle(): Candle
+    +stop(): void
+  }
+
+  class WarmupLoader {
+    +load_history(symbol, interval, limit): List<Candle>
+  }
+}
+
+package "WeaponLiveTrading.infra.exchange (new)" {
+
+  interface Broker {
+    +connect(): void
+    +get_snapshot(): ExchangeSnapshot
+    +place_order(order: Order): BrokerOrderAck
+    +cancel_order(exchange_order_id: str): void
+    +stream_fills(): void
+    +stop(): void
+  }
+
+  class PaperTestnetBroker implements Broker {
+    -client: BinanceClient
+    -env: "testnet"
+  }
+
+  class LiveBinanceBroker implements Broker {
+    -client: BinanceClient
+    -env: "prod"
+  }
+
+  class BrokerOrderAck {
+    +client_order_id: str
+    +exchange_order_id: str
+    +status: str
+  }
+
+  class ExchangeSnapshot {
+    +balances: Map
+    +open_orders: List
+    +server_time
+  }
+
+  class FillEventMapper {
+    +map(raw): OrderFilledEvent
+  }
+
+  class ExchangeInfoCache {
+    +get_filters(symbol): SymbolFilters
+  }
+
+  class SymbolFilters {
+    +tick_size
+    +step_size
+    +min_notional
+  }
+}
+
+package "WeaponLiveTrading.infra.secrets (new)" {
+
+  interface SecretsProvider {
+    +get(name: str): str
+  }
+
+  class EnvSecretsProvider implements SecretsProvider
+  class KeyVaultSecretsProvider implements SecretsProvider {
+    -vault_url: str
+    -managed_identity: bool
+  }
+}
+
+package "infra.logging (existing)" {
+  class LoggingSetup {
+    +init_logging(name, level, log_dir): str
+    +get_logger(name): Logger
+  }
+  class Logger
+}
+
+package "infra.config (existing + small extensions)" {
+  class RunConfig
+  class DataConfig
+  class BinanceLiveDataConfig
+  class ExecutionConfig
+}
+
+' =========================
+' Relationships
+' =========================
+LiveTradingRunner --> MarketDataFeed
+LiveTradingRunner --> TradingEngine
+LiveTradingRunner --> LiveResultWriter
+LiveTradingRunner --> HealthReporter
+LiveTradingRunner --> LoggingSetup
+
+TradingEngine --> BaseStrategy
+TradingEngine --> Broker
+TradingEngine --> OrderConstraintPolicy
+TradingEngine --> ReservationBook
+TradingEngine --> RiskManager
+TradingEngine --> AccountState
+TradingEngine ..> EngineAction
+TradingEngine ..> EngineActionType
+TradingEngine ..> OrderFilledEvent
+
+BinanceKlineWebSocketFeed --> WarmupLoader
+BinanceKlineWebSocketFeed ..> Candle
+
+PaperTestnetBroker --> SecretsProvider
+LiveBinanceBroker --> SecretsProvider
+PaperTestnetBroker --> ExchangeInfoCache
+LiveBinanceBroker --> ExchangeInfoCache
+FillEventMapper ..> OrderFilledEvent
+
+KeyVaultSecretsProvider ..> Logger
+EnvSecretsProvider ..> Logger
+
+RunConfig --> DataConfig
+RunConfig --> ExecutionConfig
+DataConfig <|-- BinanceLiveDataConfig
+
+@enduml
