@@ -69,10 +69,15 @@ def _to_serializable(obj: Any, ndigits: int = FLOAT_DECIMALS) -> Any:
     return obj
 
 
-def save_backtest_result(result: BacktestResult, base_dir: Path | str = "results") -> Path:
+def save_backtest_result(
+    result: BacktestResult,
+    base_dir: Path | str = "results",
+    *,
+    write_extra: bool = True,
+) -> Path:
     """
     Save a BacktestResult into:
-      results/<timestamp>/
+      results/<YYYYMMDD_HHMMSS>_<run_id>/
         - summary.json
         - trades.csv
         - equity_curve.csv
@@ -80,7 +85,10 @@ def save_backtest_result(result: BacktestResult, base_dir: Path | str = "results
     """
     base_dir = Path(base_dir)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = base_dir / ts
+
+    # Make run_id filesystem-safe
+    safe_run_id = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in str(result.run_id))
+    run_dir = base_dir / f"{ts}_{safe_run_id}"
     _ensure_dir(run_dir)
 
     # ------------------------------------------------------------------
@@ -98,6 +106,17 @@ def save_backtest_result(result: BacktestResult, base_dir: Path | str = "results
         "metrics": result.metrics,
         "benchmark_buy_hold": result.extra.get("benchmark_buy_hold"),
     }
+
+    data_range = {}
+    if isinstance(result.extra, dict):
+        dr = result.extra.get("data_range")
+        if isinstance(dr, dict):
+            data_range = dr
+
+    summary["data_start"] = data_range.get("start")
+    summary["data_end"] = data_range.get("end")
+    summary["n_bars"] = data_range.get("n_bars")
+
 
     summary_serializable = _to_serializable(summary, FLOAT_DECIMALS)
 
@@ -149,12 +168,13 @@ def save_backtest_result(result: BacktestResult, base_dir: Path | str = "results
             writer.writerow([p.timestamp.isoformat(), _fmt_float(p.equity)])
 
     # ------------------------------------------------------------------
-    # 4) Extra data (JSON, if present)
+    # 4) Extra data (JSON, if present and enabled)
     # ------------------------------------------------------------------
-    if result.extra:
+    if write_extra and result.extra:
         extra_serializable = _to_serializable(result.extra, FLOAT_DECIMALS)
-
         with (run_dir / "extra.json").open("w", encoding="utf-8") as f:
             json.dump(extra_serializable, f, indent=2)
 
     return run_dir
+
+

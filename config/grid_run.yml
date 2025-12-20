@@ -1,4 +1,4 @@
-name: "xrp_grid_1m_research"
+name: "xrp_research"
 description: "Static grid on XRPUSDT with optional parameter search."
 
 mode: backtest
@@ -12,13 +12,13 @@ data:
 
   # Adjust these according to your downloaded data range
   start: "2025-01-05T00:00:00"
-  end:   "2025-11-20T23:59:00"
+  end:   "2025-02-20T23:59:00"
   root: "historical_data"
 
   # Optional: timeframes that a research/param-search runner could iterate over
   research_timeframes:
-    - "5m"
-    - "15m"
+  #  - "5m"
+  #  - "15m"
     - "30m"
     - "60m"
 
@@ -121,6 +121,16 @@ logging:
 research:
   enabled: true          # set to false or remove block to disable research
   max_runs: 1000          # optional cap; null/omitted = run all combinations
+  primary_metric: total_return_pct
+
+  n_jobs: 8          # NEW
+  mp_start_method: spawn
+  progress_every: 10
+
+  save:
+    mode: topk        # best | topk
+    top_k: 10
+    write_extra: true
 
   param_grid:
     # lists of candidate values → Cartesian product

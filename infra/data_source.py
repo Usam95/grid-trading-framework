@@ -180,6 +180,15 @@ class LocalFileDataSource:
         return final_df
 
     # ------------------------------------------------------------------
+    # Backwards-compatible alias (some code paths use get_dataset)
+    # ------------------------------------------------------------------
+    def get_dataset(self, cfg: DatasetConfig) -> pd.DataFrame:
+        """
+        Backwards-compatible alias for older call sites.
+        Canonical API is `load(cfg)`.
+        """
+        return self.load(cfg)
+    # ------------------------------------------------------------------
     # Resampling helpers
     # ------------------------------------------------------------------
     def _timeframe_to_pandas_rule(self, timeframe: str) -> str:

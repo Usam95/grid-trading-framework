@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Literal
 
 from pydantic import BaseModel, Field
 
@@ -85,6 +85,32 @@ class GridParamGridConfig(BaseModel):
         )
 
 
+class ResearchSaveConfig(BaseModel):
+    """
+    Controls which full backtest artifacts are written to disk by the research app.
+
+    - mode="best": write best_train + best_forward only
+    - mode="topk": additionally write the top_k best train runs under output/<symbol>/topk/
+    """
+
+    mode: Literal["best", "topk"] = Field(
+        default="best",
+        description="Saving strategy for research runs.",
+    )
+
+    top_k: int = Field(
+        default=10,
+        ge=1,
+        description="How many top train runs to persist when mode='topk'.",
+    )
+
+    write_extra: bool = Field(
+        default=True,
+        description="Whether to write extra.json for each saved backtest result.",
+    )
+
+
+
 class GridResearchConfig(BaseModel):
     """
     Top-level research configuration for grid strategy parameter search.
@@ -108,8 +134,36 @@ class GridResearchConfig(BaseModel):
         description="Parameter grid for generating strategy configs.",
     )
 
+    save: ResearchSaveConfig = Field(
+        default_factory=ResearchSaveConfig,
+        description="Persist best/topK backtest artifacts to disk (app-level behavior).",
+    )
+
     primary_metric: str = Field(
     default="total_return_pct",
     description="Metric name used to rank parameter combinations."
+    )
+
+        # NEW
+    n_jobs: int = Field(
+        default=1,
+        ge=1,
+        description="Number of worker processes used for train-backtests.",
+    )
+
+    chunk_size: Optional[int] = Field(
+        default=None,
+        description="How many parameter combinations each worker evaluates per task. If None, a heuristic is used.",
+    )
+
+    mp_start_method: str = Field(
+        default="spawn",
+        description="Multiprocessing start method (Windows: 'spawn' only).",
+    )
+
+    progress_every: int = Field(
+        default=15,
+        ge=1,
+        description="Log progress every N completed train runs.",
     )
 

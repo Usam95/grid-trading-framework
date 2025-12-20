@@ -445,6 +445,19 @@ class BacktestEngine:
             result.metrics.get("win_rate_pct", 0.0),
         )
 
+
+        # --- NEW: dataset range info (what data was actually backtested) ---
+        try:
+            if candles:
+                result.extra.setdefault("data_range", {})
+                result.extra["data_range"] = {
+                    "start": candles[0].timestamp.isoformat(),
+                    "end": candles[-1].timestamp.isoformat(),
+                    "n_bars": len(candles),
+                }
+        except Exception:
+            pass
+
         return result
 
     # ----------------------------------------------------------------
