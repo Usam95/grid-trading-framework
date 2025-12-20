@@ -12,6 +12,9 @@ from infra.logging_setup import init_logging, get_logger
 from infra.config.binance_live_data_config import BinanceLiveDataConfig
 from infra.marketdata.binance_kline_stream import BinanceKlineStream
 
+from infra.secrets import EnvSecretsProvider
+from infra.exchange.binance_spot import BinanceSpotExchange
+
 
 _shutdown_requested = False
 
@@ -33,7 +36,7 @@ def main(config_path: Optional[str] = None) -> None:
     )
     logger = get_logger(run_cfg.logging.name)
 
-    logger.info("=== Starting LIVE runtime (Phase A) ===")
+    logger.info("=== Starting LiveTrading runtime (Phase A + Phase B1) ===")
     logger.info("Run: %s", run_cfg.name)
     logger.info("Mode: %s", run_cfg.mode.value)
     logger.info("Config: %s", config_path)
@@ -42,7 +45,40 @@ def main(config_path: Optional[str] = None) -> None:
     if not isinstance(run_cfg.data, BinanceLiveDataConfig):
         raise ValueError("For live_trade.py you must set data.source: binance")
 
-    # Infer websocket env from run mode (unless explicitly configured)
+    # -------------------------
+    # Phase B1: read-only exchange integration (balances + symbol filters)
+    # -------------------------
+    ex_logger = get_logger("live.exchange")
+    try:
+        secrets = EnvSecretsProvider()
+        exchange = BinanceSpotExchange.from_env(mode=run_cfg.mode, secrets=secrets, logger=ex_logger)
+        exchange.connect()
+        exchange.ping()
+
+        balances = exchange.get_balances()
+        non_zero = [b for b in balances.values() if (abs(b.free) > 0.0 or abs(b.locked) > 0.0)]
+        if non_zero:
+            ex_logger.info("Account balances (non-zero):")
+            for b in sorted(non_zero, key=lambda x: x.asset):
+                ex_logger.info("  %s free=%.8f locked=%.8f", b.asset, b.free, b.locked)
+        else:
+            ex_logger.info("Account balances: all zero (or none returned).")
+
+        filters = exchange.get_symbol_filters(run_cfg.data.symbol)
+        ex_logger.info(
+            "Symbol filters %s: tick_size=%s step_size=%s min_qty=%s min_notional=%s",
+            filters.symbol,
+            filters.tick_size,
+            filters.step_size,
+            filters.min_qty,
+            filters.min_notional,
+        )
+    except Exception as e:
+        ex_logger.exception("Exchange read-only init failed (continuing with marketdata only): %s", e)
+
+    # -------------------------
+    # Phase A: marketdata stream (closed candles)
+    # -------------------------
     inferred_testnet = run_cfg.mode == RunMode.PAPER
     use_testnet_ws = run_cfg.data.use_testnet_ws if run_cfg.data.use_testnet_ws is not None else inferred_testnet
 
