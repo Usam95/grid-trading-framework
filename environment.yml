@@ -21,7 +21,8 @@ dependencies:
   - matplotlib  # plots for equity curves, etc.
   - tqdm        # progress bars
   - rich        # nice CLI output / logging
-
+  - websocket-client
+  
   # Things we’ll likely need later for live trading & notifications
   - pip:
       - python-binance        # Binance API client (REST + WebSocket)

@@ -1,0 +1,59 @@
+# config/test_live_trade.yml
+#
+# Minimal "Phase B" live/paper test config for app/live_trade.py.
+# Later, when we plug in real strategy execution + live results, we'll switch to config/live_trade.yml.
+
+name: xrp_paper_live
+
+# NOTE:
+# Your codebase has a RunConfig with top-level "mode", but this test config keeps it simple.
+# app/live_trade.py will read engine.mode (and also accepts top-level mode if you add it).
+engine:
+  mode: paper   # paper=testnet, live=mainnet
+
+data:
+  source: binance
+  symbol: XRPUSDT
+  timeframe: 1m
+
+logging:
+  level: INFO
+
+live:
+  # ------------------------------------------------------------
+  # B1 — Market data feed (public): kline websocket -> CLOSED candles
+  #      Goal: prove kline WS works and you receive closed candles.
+  #
+  # B2 — Private read-only endpoints (needs API keys):
+  #      balances, symbol filters, open orders.
+  #
+  # B3 — Tiny MARKET order test (optional):
+  #      Goal: place a very small MARKET order and observe executionReport/fills.
+  #
+  # B4 — User Data Stream (needs API keys):
+  #      Goal: log executionReport/account position/balance events (event-driven, no polling).
+  #
+  # B5 — LIMIT order lifecycle test (needs API keys):
+  #      Goal: place LIMIT below/above market, confirm it's open, cancel it, confirm it's gone.
+  # ------------------------------------------------------------
+
+  require_private_endpoints: true
+
+  # prove B4 quickly (will be "silent" if you never place any order)
+  b4_enabled: true
+
+  # optional B3
+  b3_enabled: true
+  b3_side: BUY
+  b3_qty: 0.1
+  b3_wait_fills_sec: 20
+
+  # B5 limit lifecycle test
+  b5_enabled: true
+  b5_side: BUY
+  b5_qty: 5.0
+  b5_price_offset_pct: 0.01     # BUY => 1% below market, SELL => 1% above market
+  b5_cancel_after_sec: 5
+
+  # reduce spam in startup balance logs
+  balances_log_assets: ["USDT", "XRP", "BNB"]
