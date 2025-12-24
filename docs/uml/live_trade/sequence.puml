@@ -1,0 +1,52 @@
+@startuml
+title live_trade.py - Sequence: Startup & Bootstrap
+autonumber
+actor Operator
+participant "live_trade.main()" as Main
+participant "argparse" as Argparse
+participant "load_config()" as LoadConfig
+participant "init_logging()" as InitLogging
+participant "get_logger()" as GetLogger
+participant "LiveRepository" as Repo
+participant "EnvSecretsProvider" as Secrets
+participant "BinanceSpotExchange" as Exchange
+participant "Strategy builder\n_build_strategy_from_raw()" as StratBuilder
+
+Operator -> Main : run --config path.yml
+Main -> Argparse : parse_args()
+Argparse --> Main : args.config
+
+Main -> LoadConfig : load_config(path)
+LoadConfig --> Main : (LiveTradeConfig cfg, raw_cfg dict)
+
+Main -> InitLogging : init_logging(cfg.run_name, cfg.log_level)
+InitLogging --> Main : log_file Path
+
+Main -> GetLogger : get_logger("live", "live.exchange", ...)
+GetLogger --> Main : logger instances
+
+Main -> Repo : new LiveRepository(run_id, run_name)
+Main -> Repo : write_session({...raw_cfg...})
+
+Main -> Secrets : get_binance_keys(cfg.mode)
+alt secrets found
+  Secrets --> Main : api_key, api_secret
+else secrets missing
+  Secrets --> Main : raise Exception
+  alt cfg.require_private_endpoints = true
+    Main -> Main : raise RuntimeError (stop)
+  else public-only mode
+    Main -> Main : continue (no creds)
+  end
+end
+
+Main -> Exchange : new BinanceSpotExchange(mode, api_key, api_secret)
+Main -> Exchange : ping()
+Main -> Exchange : server_time()
+Exchange --> Main : server time info
+
+opt cfg.b8_shadow_enabled OR cfg.execute_enabled
+  Main -> StratBuilder : build strategy from cfg.strategy_raw
+  StratBuilder --> Main : BaseStrategy instance
+end
+@enduml

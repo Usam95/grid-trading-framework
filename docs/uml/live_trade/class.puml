@@ -1,0 +1,217 @@
+@startuml
+title live_trade.py - Class Diagram (Key Types and Interactions)
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+
+package "app" {
+  class live_trade_py <<module>> {
+    +main(): None
+    +load_config(path: str): (LiveTradeConfig, dict)
+    +_build_strategy_from_raw(strategy_raw: dict): BaseStrategy
+    +_exec_place_order(...): None
+    +_cancel_all_managed(order_mgr, symbol, reason): None
+    +_count_managed_open_orders(order_mgr): int
+    +_split_symbol(symbol: str): (str, str)
+    +_parse_mode(raw_mode: str): RunMode
+    +_utcnow(): str
+    +_utc_ts(): datetime
+  }
+
+  class LiveSafetyConfig <<dataclass>> {
+    +max_open_orders: int = 20
+    +max_notional_per_order: float = 50.0
+    +max_position_base: float = 10000.0
+    +cancel_all_on_shutdown: bool = True
+  }
+
+  class LiveTradeConfig <<dataclass>> {
+    +run_name: str
+    +mode: RunMode
+    +config_path: str
+    +log_level: str
+    +symbol: str
+    +interval: str
+    +require_private_endpoints: bool
+
+    +b3_enabled: bool
+    +b3_side: str
+    +b3_qty: float
+    +b3_wait_fills_sec: int
+
+    +b4_enabled: bool
+    +user_keepalive_sec: int
+    +user_reconnect_backoff_sec: int
+
+    +b5_enabled: bool
+    +b5_side: str
+    +b5_qty: float
+    +b5_price_offset_pct: float
+    +b5_cancel_after_sec: int
+
+    +b6_enabled: bool
+    +b8_shadow_enabled: bool
+    +execute_enabled: bool
+
+    +safety: LiveSafetyConfig
+    +balances_log_assets: Optional[List[str]]
+    +strategy_raw: Dict[str, Any]
+  }
+}
+
+package "infra.logging_setup" {
+  class Logging {
+    +init_logging(run_name: str, level_name: str): Path
+    +get_logger(name: str): Logger
+  }
+}
+
+package "infra.secrets" {
+  class EnvSecretsProvider {
+    +get_binance_keys(mode: RunMode): (str api_key, str api_secret)
+  }
+}
+
+package "infra.exchange.binance_spot" {
+  class BinanceSpotExchange {
+    +ping(): None
+    +server_time(): Any
+    +get_balances(non_zero_only: bool): Dict[str, (float free, float locked)]
+    +get_symbol_filters(symbol: str): SymbolFilters
+    +get_open_orders(symbol: str): List[Any]
+    +get_last_price(symbol: str): float
+  }
+
+  class SymbolFilters {
+    +tick_size: Any
+    +step_size: Any
+    +min_qty: Any
+    +min_notional: Any
+  }
+}
+
+package "infra.marketdata" {
+  class BinanceKlineStream {
+    +start(): None
+    +stop(): None
+    +next_closed_candle(timeout_sec: float): Candle
+    +status(): Any
+  }
+
+  class BinanceUserDataStream {
+    +start(): None
+    +stop(): None
+    +wait_until_connected(timeout_sec: float): bool
+  }
+
+  class UserStreamConfig {
+    +keepalive_interval_sec: int
+    +reconnect_backoff_sec: int
+  }
+}
+
+package "core.results" {
+  class LiveRepository {
+    +write_session(data: dict): None
+    +append_event(kind: str, payload: dict): None
+  }
+}
+
+package "core.live" {
+  class OrderManager {
+    +reconcile_open_orders(open_orders: List[Any]): None
+    +on_execution_report(evt: Dict[str, Any]): None
+
+    +place_market(side: str, qty: float, client_tag: str): Any
+    +place_limit(side: str, qty: float, price: float, client_tag: str): Any
+    +cancel_by_client_tag(client_tag: str, reason: str): Any
+
+    .. implied safety helpers ..
+    +cancel_all*(symbol: str, reason: str): None
+    +count_open?(): int
+  }
+
+  class EquityTracker {
+    +refresh(last_price: Optional[float]=None): None
+    +snapshot(): dict
+    +account_state(): Any
+  }
+}
+
+package "core.strategy" {
+  abstract class BaseStrategy {
+    +on_candle(candle: Candle, account_state: Any): List[EngineAction]
+    +on_order_filled(evt: OrderFilledEvent): None
+  }
+
+  class SimpleGridStrategy
+  class DynamicGridStrategy
+  BaseStrategy <|-- SimpleGridStrategy
+  BaseStrategy <|-- DynamicGridStrategy
+}
+
+package "core.engine_actions" {
+  class EngineAction {
+    +type: EngineActionType
+    +order: Any
+  }
+
+  enum EngineActionType {
+    PLACE_ORDER
+    // others possible
+  }
+}
+
+package "core.models" {
+  class Candle {
+    +timestamp: datetime
+    +open: float
+    +high: float
+    +low: float
+    +close: float
+    +volume: float
+  }
+
+  enum Side {
+    BUY
+    SELL
+  }
+
+  enum OrderType {
+    MARKET
+    LIMIT
+  }
+
+  class OrderFilledEvent {
+    +order_id: str
+    +symbol: str
+    +side: Side
+    +price: float
+    +qty: float
+    +filled_at: datetime
+    +client_tag: str
+  }
+}
+
+
+' --- Relationships / usage ---
+live_trade_py --> LiveTradeConfig : creates
+LiveTradeConfig --> LiveSafetyConfig : has
+live_trade_py --> EnvSecretsProvider : uses
+live_trade_py --> BinanceSpotExchange : uses
+live_trade_py --> BinanceKlineStream : uses
+live_trade_py --> BinanceUserDataStream : uses (optional)
+live_trade_py --> OrderManager : uses (optional)
+live_trade_py --> EquityTracker : uses (optional)
+live_trade_py --> LiveRepository : uses
+live_trade_py --> BaseStrategy : builds/uses (optional)
+
+OrderManager --> BinanceSpotExchange : submits/cancels orders
+EquityTracker --> BinanceSpotExchange : balances/prices (typ.)
+BinanceUserDataStream ..> OrderManager : exec reports
+BinanceUserDataStream ..> BaseStrategy : fills -> on_order_filled()
+BinanceKlineStream --> Candle : produces
+
+BaseStrategy --> EngineAction : returns actions
+EngineAction --> EngineActionType : type
+BaseStrategy ..> OrderFilledEvent : receives fill events
+@enduml

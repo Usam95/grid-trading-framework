@@ -62,6 +62,9 @@ class BinanceUserDataStream:
         self._listen_key: Optional[str] = None
         self._ws: Optional[WebSocketApp] = None
 
+        # Reliability: allow callers to wait until websocket is actually open.
+        self._ws_connected = threading.Event()
+
         self._ws_thread: Optional[threading.Thread] = None
         self._keepalive_thread: Optional[threading.Thread] = None
 
@@ -71,6 +74,7 @@ class BinanceUserDataStream:
 
     def start(self) -> None:
         self._stop.clear()
+        self._ws_connected.clear()
         try:
             self._listen_key = self.exchange.start_user_data_stream()
         except Exception as e:
@@ -86,8 +90,19 @@ class BinanceUserDataStream:
         self._ws_thread = threading.Thread(target=self._ws_loop, daemon=True)
         self._ws_thread.start()
 
+    def wait_until_connected(self, timeout_sec: float = 10.0) -> bool:
+        """
+        Block until the user websocket is OPEN (on_open called) or timeout elapses.
+        Returns True if connected, False if timed out.
+        """
+        ok = self._ws_connected.wait(timeout=timeout_sec)
+        if not ok:
+            self.log.warning("User websocket not connected after %.1fs.", timeout_sec)
+        return ok
+
     def stop(self) -> None:
         self._stop.set()
+        self._ws_connected.clear()
 
         # close ws (will unblock run_forever)
         try:
@@ -109,7 +124,9 @@ class BinanceUserDataStream:
     # ---------------------------
 
     def _keepalive_loop(self) -> None:
-        assert self._listen_key is not None
+        if not self._listen_key:
+            return
+        
         while not self._stop.is_set():
             # Sleep in smaller chunks so shutdown is quick
             total = self.cfg.keepalive_interval_sec
@@ -156,12 +173,16 @@ class BinanceUserDataStream:
 
     def _on_open(self, ws: Any) -> None:
         self.log.info("User websocket connected.")
+        self._ws_connected.set()
 
     def _on_close(self, ws: Any, status_code: Any, msg: Any) -> None:
         self.log.warning(f"User websocket closed: status={status_code} msg={msg}")
+        self._ws_connected.clear()
 
     def _on_error(self, ws: Any, error: Any) -> None:
         self.log.warning(f"User websocket error: {error}")
+        # conservatively mark as not-connected; reconnect loop will re-open
+        self._ws_connected.clear()
 
     def _on_message(self, ws: Any, message: str) -> None:
         try:
@@ -217,17 +238,29 @@ class BinanceUserDataStream:
         otype = e.get("o")
         status = e.get("X")
         order_id = e.get("i")
-        client_id = e.get("c")
+        client_id = e.get("c")   # clientOrderId
+        orig_client_id = e.get("C")  # origClientOrderId (sometimes set/used in some updates)
 
         last_qty = e.get("l")
         last_px = e.get("L")
         cum_qty = e.get("z")
         cum_quote = e.get("Z")
 
+        # Prefer the client id that matches our scheme if possible.
+        # (Later B6 uses GT-... ids, but your B5 uses B5-... which is still deterministic-ish.)
+        preferred_id = client_id
+        if isinstance(orig_client_id, str) and orig_client_id:
+            # If we see "GT-" or "B5-" in either, prefer that one.
+            for candidate in (client_id, orig_client_id):
+                if isinstance(candidate, str) and (candidate.startswith("GT-") or candidate.startswith("B5-")):
+                    preferred_id = candidate
+                    break
+
         self.log.info(
             "EXEC_REPORT "
             f"{symbol} {side} {otype} status={status} "
-            f"orderId={order_id} clientId={client_id} "
+            f"orderId={order_id} clientId={preferred_id} "
+            f"(c={client_id} C={orig_client_id}) "
             f"lastFill={last_qty}@{last_px} cumQty={cum_qty} cumQuote={cum_quote}"
         )
 

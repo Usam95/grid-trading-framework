@@ -53,6 +53,9 @@ def _quantize_down_decimal(value: float, step: float) -> Decimal:
     q = q.quantize(d_step, rounding=ROUND_DOWN)
     return q
 
+def _fmt_price(px: float) -> str:
+    s = f"{px:.18f}".rstrip("0").rstrip(".")
+    return s if s else "0"
 
 def _fmt_decimal(d: Decimal) -> str:
     """
@@ -152,6 +155,9 @@ class BinanceSpotExchange:
                 mn = f.get("minNotional")
                 if mn is not None:
                     min_notional = _to_float(mn)
+        
+        if tick_size <= 0 or step_size <= 0:
+            raise RuntimeError(f"Bad symbol filters for {symbol}: tick={tick_size} step={step_size}")
 
         return SymbolFilters(
             tick_size=tick_size,
@@ -168,11 +174,11 @@ class BinanceSpotExchange:
 
     def get_last_price(self, symbol: str) -> float:
         """
-        Public ticker price (used for B5 offset pricing).
+        Public ticker price.
         """
         res = self.client.get_symbol_ticker(symbol=symbol)
         if isinstance(res, dict) and "price" in res:
-            return float(res["price"])
+            return float(res["price"] or 0.0)
         raise RuntimeError(f"Unexpected ticker response: {res!r}")
 
     # -------------------------
@@ -316,13 +322,13 @@ class BinanceSpotExchange:
         if order_id is None and client_order_id is None:
             raise ValueError("Provide order_id or client_order_id")
 
-        params: Dict[str, Any] = dict(symbol=symbol)
         if order_id is not None:
-            params["orderId"] = order_id
-        if client_order_id is not None:
-            params["origClientOrderId"] = client_order_id
+            params = {"symbol": symbol, "orderId": order_id}
+            self.logger.info("Cancel order by orderId: %s", params)
+            return self.client.cancel_order(**params)
 
-        self.logger.info("Cancel order: %s", params)
+        params = {"symbol": symbol, "origClientOrderId": client_order_id}
+        self.logger.info("Cancel order by clientOrderId: %s", params)
         return self.client.cancel_order(**params)
 
     def cancel_all_open_orders(self, symbol: str) -> Dict[str, Any]:

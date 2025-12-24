@@ -51,6 +51,7 @@ logs/
 resultings/
 output/
 *.log
+runs/
 
 # -------------------------
 # Large / local data

@@ -116,6 +116,12 @@ class AccountState:
     total_value: float
     invested_cost: float
 
+    # optional live-only details
+    base_free: float = 0.0
+    base_locked: float = 0.0
+    quote_free: float = 0.0
+    quote_locked: float = 0.0
+    
     @property
     def unrealized_pnl(self) -> float:
         """

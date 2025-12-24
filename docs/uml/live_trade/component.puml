@@ -1,0 +1,112 @@
+@startuml
+title live_trade.py - Component Diagram (Runtime Architecture)
+skinparam componentStyle rectangle
+skinparam shadowing false
+
+actor "Operator\n(CLI)" as Operator
+
+component "live_trade.py\n(main runtime)" as LiveTrade
+
+package "infra.config" {
+  component "YAML config file\n(config/*.yml)" as Yaml
+  component "load_config()" as LoadConfig
+  component "RunMode" as RunMode
+}
+
+package "infra.logging_setup" {
+  component "init_logging()" as InitLogging
+  component "get_logger()" as GetLogger
+}
+
+package "infra.secrets" {
+  component "EnvSecretsProvider" as Secrets
+}
+
+package "infra.exchange" {
+  component "BinanceSpotExchange" as Exchange
+  component "SymbolFilters" as Filters
+}
+
+package "infra.marketdata" {
+  component "BinanceKlineStream\n(public ws)" as KlineStream
+  component "BinanceUserDataStream\n(private ws)" as UserStream
+  component "UserStreamConfig" as UserStreamCfg
+}
+
+package "core.live" {
+  component "OrderManager" as OrderMgr
+  component "EquityTracker" as Equity
+}
+
+package "core.results" {
+  component "LiveRepository\n(session.json + events.jsonl)" as Repo
+}
+
+package "core.strategy" {
+  component "BaseStrategy" as Strategy
+  component "SimpleGridStrategy" as SimpleGrid
+  component "DynamicGridStrategy" as DynGrid
+}
+
+package "core.engine_actions" {
+  component "EngineAction" as Action
+  component "EngineActionType\n(PLACE_ORDER,...)" as ActionType
+}
+
+package "core.models" {
+  component "Candle" as Candle
+  component "OrderFilledEvent" as FilledEvt
+  component "Side" as Side
+  component "OrderType" as OrderType
+}
+
+queue "exec_reports Queue\n(Execution Reports)" as ExecQueue
+
+Operator --> LiveTrade : run: python -m app.live_trade --config ...
+LiveTrade --> LoadConfig : load_config(path)
+LoadConfig --> Yaml : read + parse YAML
+LoadConfig --> RunMode : _parse_mode()
+
+LiveTrade --> InitLogging : init_logging(run_name, level)
+LiveTrade --> GetLogger : get_logger(...)
+
+LiveTrade --> Repo : create LiveRepository(run_id,...)\nwrite_session(...)
+Repo ..> Yaml : persist raw config in session
+
+LiveTrade --> Secrets : get_binance_keys(mode)
+Secrets --> LiveTrade : api_key/api_secret (or error)
+
+LiveTrade --> Exchange : new BinanceSpotExchange(mode, key, secret)
+LiveTrade --> Exchange : ping()\nserver_time()
+
+LiveTrade --> Strategy : _build_strategy_from_raw()\n(if B8 or B9)
+Strategy <|-- SimpleGrid
+Strategy <|-- DynGrid
+
+LiveTrade --> Exchange : get_balances()\nget_symbol_filters()\nget_open_orders()
+LiveTrade --> Filters : obtained from exchange
+
+LiveTrade --> OrderMgr : new OrderManager(...)\nreconcile_open_orders(...)
+OrderMgr --> Exchange : place/cancel methods\n(open orders reconcile)
+
+LiveTrade --> Equity : new EquityTracker(exchange, symbol)\nrefresh()
+Equity --> Exchange : get_balances(), prices\n(implementation detail)
+
+LiveTrade --> UserStream : new BinanceUserDataStream(..., on_execution_report)
+UserStream --> UserStreamCfg : keepalive + reconnect config
+UserStream --> Exchange : start private ws / listenKey
+UserStream --> LiveTrade : callback on exec reports
+LiveTrade --> ExecQueue : put(evt)
+LiveTrade --> OrderMgr : on_execution_report(evt)
+LiveTrade --> Strategy : on_order_filled(OrderFilledEvent)\n(when TRADE + FILLED/Partial)
+
+LiveTrade --> KlineStream : start()
+KlineStream --> LiveTrade : next_closed_candle()
+
+LiveTrade --> Strategy : on_candle(candle, account_state) -> actions
+LiveTrade --> OrderMgr : _exec_place_order via OrderManager\n(B9 execute)
+LiveTrade --> Repo : append_event(...)
+LiveTrade --> KlineStream : stop()
+LiveTrade --> UserStream : stop()
+LiveTrade --> OrderMgr : cancel_all_managed on shutdown\n(kill-switch if enabled)
+@enduml

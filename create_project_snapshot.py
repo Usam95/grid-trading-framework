@@ -56,6 +56,7 @@ DEFAULT_EXCLUDED_DIRS: Set[str] = {
     "nlohmann",
     "docs",
     "historical_data",
+    "runs"
 #    "core",
 #    "config",
 }

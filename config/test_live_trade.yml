@@ -37,23 +37,59 @@ live:
   #      Goal: place LIMIT below/above market, confirm it's open, cancel it, confirm it's gone.
   # ------------------------------------------------------------
 
+  # B2 = private REST bootstrap (balances, filters, open orders).
+  # If true, we require BINANCE_* env vars to exist; otherwise we run read-only.
   require_private_endpoints: true
 
+  # B3 = tiny MARKET order to prove private REST execution works (optional).
+  # optional B3
+  b3_enabled: false
+  b3_side: BUY
+  b3_qty: 10.0
+  b3_wait_fills_sec: 20
+
+  # B4 = user data stream (listenKey websocket) to receive executionReport / fills.
   # prove B4 quickly (will be "silent" if you never place any order)
   b4_enabled: true
 
-  # optional B3
-  b3_enabled: true
-  b3_side: BUY
-  b3_qty: 0.1
-  b3_wait_fills_sec: 20
 
+  # B5 = LIMIT lifecycle test (place limit below market, then cancel).
   # B5 limit lifecycle test
-  b5_enabled: true
+  b5_enabled: false
   b5_side: BUY
   b5_qty: 5.0
   b5_price_offset_pct: 0.01     # BUY => 1% below market, SELL => 1% above market
   b5_cancel_after_sec: 5
 
-  # reduce spam in startup balance logs
+  # B6 = OrderManager (idempotent clientOrderId + reconciliation + tracking)
+  b6_enabled: true
+
+  b8_shadow_enabled: false
+
+  # B9
+  execute_enabled: true   # <- flip to true only when you trust the logs
+
+  safety:
+    max_open_orders: 40
+    max_notional_per_order: 50.0
+    max_position_base: 2000.0
+    cancel_all_on_shutdown: true
+
+  # # Reduce spam: log only these assets on startup (instead of all non-zero).
   balances_log_assets: ["USDT", "XRP", "BNB"]
+
+  cancel_open_orders_on_startup: true
+  cancel_open_orders_only_managed: true
+  cancel_open_orders_prefixes: ["GT-", "LT-", "LT_"]
+  
+strategy:
+  kind: grid.dynamic
+  symbol: XRPUSDT
+  base_order_size: 10
+  n_levels: 20
+  range_mode: percent
+  spacing: geometric
+  lower_pct: 0.1
+  upper_pct: 0.1
+
+
