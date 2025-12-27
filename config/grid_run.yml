@@ -17,8 +17,8 @@ data:
 
   # Optional: timeframes that a research/param-search runner could iterate over
   research_timeframes:
-    - "5m"
-    - "15m"
+    #- "5m"
+    #- "15m"
     - "30m"
     - "60m"
 

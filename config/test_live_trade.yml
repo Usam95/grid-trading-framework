@@ -81,12 +81,12 @@ live:
   cancel_open_orders_on_startup: true
   cancel_open_orders_only_managed: true
   cancel_open_orders_prefixes: ["GT-", "LT-", "LT_"]
-  
+
 strategy:
   kind: grid.dynamic
   symbol: XRPUSDT
-  base_order_size: 10
-  n_levels: 20
+  base_order_size: 5
+  n_levels: 60
   range_mode: percent
   spacing: geometric
   lower_pct: 0.1
