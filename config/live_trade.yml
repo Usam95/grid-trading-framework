@@ -37,6 +37,8 @@ strategy:
 trading:
   enabled: true
   require_private_endpoints: true
+  reconcile_interval_sec: 120
+
 
   user_stream:
     enabled: true

@@ -7,6 +7,85 @@ from core.engine_actions import EngineAction, EngineActionType
 from core.models import Candle, OrderType, Side
 
 
+
+def _extract_order_ids(res: Any) -> tuple[str, str]:
+    """
+    Try to extract (exchange_order_id, client_order_id) from OrderManager REST result.
+    Works with dicts and simple objects.
+    """
+    if res is None:
+        return "", ""
+
+    exchange_oid = ""
+    client_oid = ""
+
+    if isinstance(res, dict):
+        exchange_oid = str(res.get("orderId") or res.get("order_id") or res.get("id") or "")
+        client_oid = str(res.get("clientOrderId") or res.get("client_order_id") or res.get("clientOrderID") or "")
+        return exchange_oid, client_oid
+
+    # object-like
+    for k in ("orderId", "order_id", "id"):
+        if hasattr(res, k):
+            exchange_oid = str(getattr(res, k) or "")
+            break
+    for k in ("clientOrderId", "client_order_id", "clientOrderID"):
+        if hasattr(res, k):
+            client_oid = str(getattr(res, k) or "")
+            break
+
+    return exchange_oid, client_oid
+
+
+def _persist_submitted_intent(
+    *,
+    repo: Any,
+    symbol: str,
+    side: str,
+    order_type: str,
+    px: float,
+    qty: float,
+    client_tag: str,
+    res: Any,
+) -> None:
+    """
+    Milestone A1:
+    Persist a durable trace immediately after successful REST submit,
+    BEFORE any execution reports arrive.
+    """
+    if not hasattr(repo, "append_order"):
+        return
+
+    exchange_oid, client_oid = _extract_order_ids(res)
+
+    # We strongly prefer the true exchange clientOrderId.
+    # If it is missing, we still write a row (client id empty) and keep the tag in events.
+    repo.append_order(
+        symbol=symbol,
+        side=side,
+        order_type=order_type,
+        client_order_id=client_oid,
+        exchange_order_id=exchange_oid,
+        status="SUBMITTED",
+        qty=float(qty),
+        price=float(px),
+    )
+
+    repo.append_event(
+        "order.submitted_intent",
+        {
+            "symbol": symbol,
+            "side": side,
+            "type": order_type,
+            "qty": float(qty),
+            "price": float(px),
+            "client_tag": client_tag,
+            "exchange_order_id": exchange_oid,
+            "client_order_id": client_oid,
+        },
+    )
+
+
 def count_managed_open_orders(order_mgr) -> int:
     # support older/internal attribute names defensively
     for attr in ("open_orders", "_open_orders", "_orders"):
@@ -110,19 +189,48 @@ def exec_place_order(
     # Submit via OrderManager
     if order.type == OrderType.MARKET:
         res = order_mgr.place_market(side=side_u, qty=qty, intent="grid", tag=order.client_tag)
-        repo.append_event("trade.submitted", {"type": "MARKET", "side": side_u, "qty": qty, "client_tag": order.client_tag, "result": str(res)})
+
+        _persist_submitted_intent(
+            repo=repo,
+            symbol=str(getattr(exchange, "symbol", "") or action.order.symbol or ""),  # safe fallback
+            side=side_u,
+            order_type="MARKET",
+            px=float(px),
+            qty=float(qty),
+            client_tag=str(order.client_tag),
+            res=res,
+        )
+
+        repo.append_event(
+            "trade.submitted",
+            {"type": "MARKET", "side": side_u, "qty": qty, "client_tag": order.client_tag, "result": str(res)},
+        )
         log.info("SUBMIT: MARKET %s qty=%.8f tag=%s", side_u, qty, order.client_tag)
 
     elif order.type == OrderType.LIMIT:
         if px <= 0:
             repo.append_event("trade.refused", {"reason": "limit_px<=0", "client_tag": order.client_tag})
             return
+
         res = order_mgr.place_limit(side=side_u, qty=qty, price=px, intent="grid", tag=order.client_tag)
-        repo.append_event("trade.submitted", {"type": "LIMIT", "side": side_u, "qty": qty, "price": px, "client_tag": order.client_tag, "result": str(res)})
+
+        _persist_submitted_intent(
+            repo=repo,
+            symbol=str(getattr(exchange, "symbol", "") or action.order.symbol or ""),  # safe fallback
+            side=side_u,
+            order_type="LIMIT",
+            px=float(px),
+            qty=float(qty),
+            client_tag=str(order.client_tag),
+            res=res,
+        )
+
+        repo.append_event(
+            "trade.submitted",
+            {"type": "LIMIT", "side": side_u, "qty": qty, "price": px, "client_tag": order.client_tag, "result": str(res)},
+        )
         log.info("SUBMIT: LIMIT %s qty=%.8f price=%.8f tag=%s", side_u, qty, px, order.client_tag)
 
-    else:
-        repo.append_event("trade.refused", {"reason": f"unsupported_order_type:{order.type}", "client_tag": order.client_tag})
 
 
 def execute_actions(

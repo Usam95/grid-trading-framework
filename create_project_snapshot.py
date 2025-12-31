@@ -111,15 +111,16 @@ DEFAULT_ONLY_FILENAMES: Set[str] = {
     # Examples:
     # "CMakeLists.txt",
     # "Dockerfile",
-    "utils.py",
-    "account_state.py",
-    "execution.py",
-    "user_stream.py",
-    "runtime.py",
-    "live_trade.py",
-    "strategy_builder.py",
-    "live_trade.yml",
-    "trading_config.py"
+#    "utils.py",
+#    "account_state.py",
+#    "execution.py",
+#    "user_stream.py",
+#    "runtime.py",
+#    "live_trade.py",
+#    "strategy_builder.py",
+#    "live_trade.yml",
+#    "trading_config.py",
+#    "equity_tracker.py"
 
 }
 

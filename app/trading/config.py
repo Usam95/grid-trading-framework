@@ -22,7 +22,7 @@ class TradingSettings:
     raw_cfg: Dict[str, Any]
     config_path: str
 
-    execute: bool
+    enabled: bool
     require_private_endpoints: bool
 
     trading: TradingRuntimeConfig
@@ -50,14 +50,14 @@ def load_trading_settings(path: Union[str, Path]) -> TradingSettings:
         run_cfg.trading = TradingRuntimeConfig()
 
     trading = run_cfg.trading
-    execute = bool(trading.execute)
+    enabled = bool(trading.enabled)
     require_private = bool(trading.require_private_endpoints)
 
     return TradingSettings(
         run_cfg=run_cfg,
         raw_cfg=raw,
         config_path=str(p),
-        execute=execute,
+        enabled=enabled,
         require_private_endpoints=require_private,
         trading=trading,
     )

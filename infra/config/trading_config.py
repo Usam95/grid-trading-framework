@@ -40,6 +40,7 @@ class TradingRuntimeConfig(BaseModel):
     """
     enabled: bool = True                     # replaces execute_enabled
     require_private_endpoints: bool = True   # keep (it’s real, not a “phase”)
+    reconcile_interval_sec : int = Field(120, ge=0)
 
     user_stream: TradingUserStreamConfig = Field(default_factory=TradingUserStreamConfig)
     startup_orders: TradingStartupOrdersConfig = Field(default_factory=TradingStartupOrdersConfig)

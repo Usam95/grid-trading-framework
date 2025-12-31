@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from queue import Queue, Empty
+from typing import Any, Dict, Optional
 
 from infra.logging_setup import init_logging, get_logger
 from infra.secrets import EnvSecretsProvider
@@ -14,15 +15,15 @@ from infra.marketdata.binance_kline_stream import BinanceKlineStream
 
 from core.results.live_repository import LiveRepository
 from core.strategy.base import BaseStrategy
-from core.live.order_manager import OrderManager
+from core.models import OrderFilledEvent, Side
+from core.live.order_manager import OrderManager, decode_grid_tag_from_client_order_id
 from core.live.equity_tracker import EquityTracker
 
 from app.trading.config import TradingSettings, resolve_use_testnet_ws
-from app.trading.utils import utcnow_iso, mask_secret, split_symbol
+from app.trading.utils import utcnow_iso, mask_secret, split_symbol, to_float, ms_to_dt_utc
 from app.trading.user_stream import start_user_stream
 from app.trading.account_state import build_account_state
-from app.trading.execution import execute_actions, cancel_all_managed
-
+from app.trading.execution import execute_actions
 
 
 @dataclass
@@ -59,13 +60,31 @@ class TradingContext:
     user_stream: Optional[object] = None
     kline_stream: Optional[object] = None
 
-    # ✅ NEW: thread-safe queues (user stream thread -> main thread)
-    exec_reports: "Queue[Dict[str, Any]]" = Queue()
-    fill_events: "Queue[OrderFilledEvent]" = Queue()
+    # thread-safe queues (user stream thread -> main thread)
+    exec_reports: Queue[Dict[str, Any]] = field(default_factory=Queue)
+    fill_events: Queue[OrderFilledEvent] = field(default_factory=Queue)
 
     @property
     def trading(self):
         return self.settings.trading
+
+def persist_equity(ctx: TradingContext, *, reason: str, last_price: Optional[float] = None) -> None:
+    if ctx.equity is None:
+        return
+    try:
+        px, b, q = ctx.equity.snapshot(last_price=last_price)
+        ctx.repo.append_equity(
+            symbol=ctx.symbol,
+            price=float(px),
+            base_free=float(getattr(b, "free", 0.0)),
+            base_locked=float(getattr(b, "locked", 0.0)),
+            quote_free=float(getattr(q, "free", 0.0)),
+            quote_locked=float(getattr(q, "locked", 0.0)),
+        )
+        ctx.repo.append_event("equity.persisted", {"reason": reason, "price": float(px)})
+    except Exception as e:
+        # DO NOT swallow: this is how we debug "equity.csv only one row"
+        ctx.repo.append_event("equity.persist_failed", {"reason": reason, "error": str(e)})
 
 
 def _persist_execution_report(ctx: TradingContext, evt: Dict[str, Any]) -> None:
@@ -74,7 +93,6 @@ def _persist_execution_report(ctx: TradingContext, evt: Dict[str, Any]) -> None:
     """
     ctx.repo.append_event("execution_report", evt)
 
-    # Persist order snapshot
     try:
         sym = str(evt.get("s") or ctx.symbol)
         side = str(evt.get("S") or "")
@@ -99,7 +117,6 @@ def _persist_execution_report(ctx: TradingContext, evt: Dict[str, Any]) -> None:
                 price=price,
             )
 
-        # Persist fills
         if exec_type.upper() == "TRADE":
             fill_qty = float(evt.get("l") or 0.0)
             fill_price = float(evt.get("L") or 0.0)
@@ -175,7 +192,6 @@ def pump_async_events(ctx: TradingContext, *, max_reports: int = 1000, max_fills
         except Empty:
             break
 
-        # Persist + update OrderManager in main thread
         _persist_execution_report(ctx, evt)
 
         if ctx.order_mgr is not None:
@@ -184,7 +200,6 @@ def pump_async_events(ctx: TradingContext, *, max_reports: int = 1000, max_fills
             except Exception:
                 pass
 
-        # Convert TRADE to fill event (still main thread)
         _maybe_enqueue_fill(ctx, evt)
         n += 1
 
@@ -205,7 +220,6 @@ def pump_async_events(ctx: TradingContext, *, max_reports: int = 1000, max_fills
         except Exception:
             pass
 
-        # Optional: keep EquityTracker consistent in the same thread
         if ctx.equity is not None and hasattr(ctx.equity, "update_on_fill"):
             try:
                 ctx.equity.update_on_fill(ofe)
@@ -231,7 +245,7 @@ def _setup_logging(settings: TradingSettings):
     log.info("Config: %s", settings.config_path)
     log.info("Log level: %s", log_level)
     log.info("Log file: %s", str(log_file))
-    log.info("Execute: %s | Require private: %s", settings.execute, settings.require_private_endpoints)
+    log.info("Execute: %s | Require private: %s", settings.enabled, settings.require_private_endpoints)
 
     return log, ex_log, md_log, us_log, ord_log, log_level
 
@@ -289,7 +303,6 @@ def _setup_private(ctx: TradingContext) -> None:
         ctx.repo.append_event("private.disabled", {"reason": "missing_creds"})
         return
 
-    # balances logging
     balances = ctx.exchange.get_balances(non_zero_only=True)
     ctx.log.info("Account balances (non-zero):")
     assets = list(getattr(ctx.trading, "balances_log_assets", []) or [])
@@ -303,28 +316,23 @@ def _setup_private(ctx: TradingContext) -> None:
             free, locked = balances[asset]
             ctx.log.info("  %s free=%.8f locked=%.8f", asset, free, locked)
 
-    # symbol filters
     ctx.filters = ctx.exchange.get_symbol_filters(ctx.symbol)
     ctx.log.info(
         "Symbol filters %s: tick_size=%s step_size=%s min_qty=%s min_notional=%s",
         ctx.symbol, ctx.filters.tick_size, ctx.filters.step_size, ctx.filters.min_qty, ctx.filters.min_notional
     )
 
-    # open orders
     open_orders = ctx.exchange.get_open_orders(ctx.symbol)
     ctx.log.info("Open orders: %d", len(open_orders))
 
-    # startup cancellation config
     startup = ctx.trading.startup_orders
     cancel_on_startup = bool(getattr(startup, "cancel_open_orders_on_startup", False))
     only_managed = bool(getattr(startup, "cancel_only_managed", True))
     prefixes = tuple(getattr(startup, "cancel_prefixes", []) or ["GT-", "LT-", "LT_"])
 
-    # never allow cancel-all on LIVE unless managed-only
     if ctx.settings.run_cfg.mode == RunMode.LIVE and cancel_on_startup and not only_managed:
         raise RuntimeError("Refusing to cancel ALL open orders on LIVE. Keep cancel_only_managed=true.")
 
-    # OrderManager: single truth path for reconcile + cancel + submit
     ctx.order_mgr = OrderManager(
         run_name=ctx.settings.run_cfg.name,
         symbol=ctx.symbol,
@@ -335,7 +343,6 @@ def _setup_private(ctx: TradingContext) -> None:
     ctx.order_mgr.reconcile_open_orders(open_orders)
     ctx.repo.append_event("orders.reconciled", {"open_orders": int(len(open_orders))})
 
-    # optional startup cleanup
     if cancel_on_startup and open_orders:
         ctx.log.warning(
             "Startup cleanup: canceling open orders (only_managed=%s prefixes=%s)",
@@ -360,11 +367,13 @@ def _setup_private(ctx: TradingContext) -> None:
             },
         )
 
-    # equity tracker (preferred for AccountState)
     try:
         ctx.equity = EquityTracker(exchange=ctx.exchange, symbol=ctx.symbol)
         px, b, q = ctx.equity.snapshot()
-        ctx.repo.append_event("equity.snapshot", ctx.equity.snapshot_json() if hasattr(ctx.equity, "snapshot_json") else {"price": px})
+        ctx.repo.append_event(
+            "equity.snapshot",
+            ctx.equity.snapshot_json() if hasattr(ctx.equity, "snapshot_json") else {"price": px},
+        )
         ctx.repo.append_equity(
             symbol=ctx.symbol,
             price=float(px),
@@ -377,7 +386,6 @@ def _setup_private(ctx: TradingContext) -> None:
         ctx.log.warning("EquityTracker init failed (%s). Will use REST fallback.", e)
         ctx.equity = None
 
-    # user stream
     ctx.user_stream = start_user_stream(ctx)
 
 
@@ -404,25 +412,20 @@ def _shutdown(ctx: TradingContext) -> None:
       - cancels only managed orders (by prefixes) for kill-switch
       - stops streams
     """
-
-    # --- stop market stream first (no more candles)
     try:
         if ctx.kline_stream is not None:
             ctx.kline_stream.stop()
     except Exception:
         pass
 
-    # --- kill-switch: cancel managed open orders only (prefix-scoped)
     cancel_on_shutdown = bool(getattr(ctx.trading.safety, "cancel_all_on_shutdown", True))
     if cancel_on_shutdown and ctx.order_mgr is not None and ctx.has_private_creds:
-        # read prefixes robustly (supports old/new config field names)
         startup = getattr(ctx.trading, "startup_orders", None)
 
         prefixes_list = None
         if startup is not None:
             prefixes_list = (
-                getattr(startup, "cancel_prefixes", None)  # new
-                or getattr(startup, "cancel_open_orders_prefixes", None)  # legacy naming
+                getattr(startup, "cancel_prefixes", None)
                 or getattr(startup, "cancel_open_orders_prefixes", None)
             )
 
@@ -435,16 +438,14 @@ def _shutdown(ctx: TradingContext) -> None:
             )
 
             attempted = None
-
-            # Try common signatures of cancel_all_managed safely (no cancel-all fallback!)
             try:
                 attempted = ctx.order_mgr.cancel_all_managed(reason="shutdown_killswitch", prefixes=prefixes)
             except TypeError:
-                # some variants include symbol
                 try:
-                    attempted = ctx.order_mgr.cancel_all_managed(symbol=ctx.symbol, reason="shutdown_killswitch", prefixes=prefixes)
+                    attempted = ctx.order_mgr.cancel_all_managed(
+                        symbol=ctx.symbol, reason="shutdown_killswitch", prefixes=prefixes
+                    )
                 except TypeError:
-                    # older variants might not accept prefixes, still safe (managed-only)
                     attempted = ctx.order_mgr.cancel_all_managed(reason="shutdown_killswitch")
 
             ctx.repo.append_event(
@@ -452,12 +453,8 @@ def _shutdown(ctx: TradingContext) -> None:
                 {"ok": True, "attempted": int(attempted) if attempted is not None else None, "prefixes": list(prefixes)},
             )
 
-            # Optional: give exchange/user-stream a brief moment to emit cancel reports
-            # (only useful if user_stream is still running right now)
             try:
                 time.sleep(0.2)
-                # if you have pump_async_events(ctx) in this module, you can call it here:
-                # pump_async_events(ctx)
             except Exception:
                 pass
 
@@ -467,13 +464,11 @@ def _shutdown(ctx: TradingContext) -> None:
                 {"ok": False, "error": str(e), "prefixes": list(prefixes)},
             )
 
-    # --- stop user stream last
     try:
         if ctx.user_stream is not None:
             ctx.user_stream.stop()
     except Exception:
         pass
-
 
 
 def run_trading(settings: TradingSettings) -> None:
@@ -519,30 +514,47 @@ def run_trading(settings: TradingSettings) -> None:
         has_private_creds=has_private,
     )
 
-    # private setup + user stream
     _setup_private(ctx)
-
-    # market stream
     ctx.kline_stream = _start_market_stream(ctx)
+
+    reconcile_interval = float(getattr(ctx.trading, "reconcile_interval_sec", 120) or 0.0)
+    last_reconcile_ts = 0.0
 
     try:
         while True:
-            # ✅ Process fills/reports frequently, not only once per candle
+
             pump_async_events(ctx)
 
-            # Short timeout so we can keep pumping while waiting for a candle
+            # Milestone A2: periodic reconciliation (recover from missed stream messages)
+            if (
+                reconcile_interval > 0
+                and ctx.has_private_creds
+                and ctx.order_mgr is not None
+                and (time.time() - last_reconcile_ts) >= reconcile_interval
+            ):
+                try:
+                    open_orders = ctx.exchange.get_open_orders(ctx.symbol)
+                    ctx.order_mgr.reconcile_open_orders(open_orders)
+                    ctx.repo.append_event(
+                        "orders.reconciled.periodic",
+                        {"open_orders": int(len(open_orders)), "interval_sec": reconcile_interval},
+                    )
+                except Exception as e:
+                    ctx.repo.append_event("orders.reconcile_failed", {"where": "periodic", "error": str(e)})
+
+                last_reconcile_ts = time.time()
+
             try:
                 candle = ctx.kline_stream.next_closed_candle(timeout_sec=2.0)
             except TimeoutError:
                 continue
 
-            # Process anything that arrived right before/at candle close
             pump_async_events(ctx)
 
             ctx.log.info(
-                "CLOSED candle %s O=%.8f H=%.8f L=%.8f C=%.8f V=%.8f",
+                "CLOSED candle %s O=%.8f H=%.8f H=%.8f L=%.8f C=%.8f V=%.8f",
                 candle.timestamp.isoformat(),
-                candle.open, candle.high, candle.low, candle.close, candle.volume
+                candle.open, candle.high, candle.high, candle.low, candle.close, candle.volume
             )
             ctx.repo.append_event(
                 "candle.closed",
@@ -555,6 +567,11 @@ def run_trading(settings: TradingSettings) -> None:
                     "volume": float(candle.volume),
                 },
             )
+            
+            if ctx.equity is not None:
+                ctx.equity.refresh(last_price=float(candle.close))
+
+            persist_equity(ctx, reason="candle_closed", last_price=float(candle.close))
 
             if not ctx.has_private_creds:
                 ctx.repo.append_event("strategy.skipped", {"reason": "missing_private_creds"})
@@ -574,7 +591,7 @@ def run_trading(settings: TradingSettings) -> None:
             actions = ctx.strategy.on_candle(candle, account_state) or []
             ctx.repo.append_event("strategy.actions", {"n": len(actions), "actions": [str(a) for a in actions]})
 
-            if not settings.execute:
+            if not settings.enabled:
                 continue
 
             if ctx.order_mgr is None:
@@ -591,6 +608,8 @@ def run_trading(settings: TradingSettings) -> None:
                 log=ctx.log,
                 repo=ctx.repo,
             )
+
+            persist_equity(ctx, reason="after_execute_actions", last_price=float(candle.close))
 
     except KeyboardInterrupt:
         ctx.log.info("Stopping trading runtime (KeyboardInterrupt)...")

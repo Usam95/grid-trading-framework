@@ -193,7 +193,7 @@ class OrderManager:
                 continue
             to_cancel.append(mo)
 
-        self.log.warning("B6: cancel_all_managed reason=%s count=%d prefixes=%s", reason, len(to_cancel), prefixes)
+        self.log.warning("cancel_all_managed reason=%s count=%d prefixes=%s", reason, len(to_cancel), prefixes)
 
         attempted = 0
         for mo in to_cancel:
@@ -201,9 +201,9 @@ class OrderManager:
             try:
                 # Prefer cancel by exchange order id when we have it, otherwise by client id
                 self.cancel(order_id=mo.exchange_order_id, client_order_id=None if mo.exchange_order_id else mo.client_order_id)
-                self.log.info("B6: canceled clientId=%s oid=%s reason=%s", mo.client_order_id, mo.exchange_order_id, reason)
+                self.log.info("canceled clientId=%s oid=%s reason=%s", mo.client_order_id, mo.exchange_order_id, reason)
             except Exception as e:
-                self.log.warning("B6: failed to cancel clientId=%s oid=%s: %s", mo.client_order_id, mo.exchange_order_id, e)
+                self.log.warning("failed to cancel clientId=%s oid=%s: %s", mo.client_order_id, mo.exchange_order_id, e)
         return attempted
 
     def cancel_all_open_orders(self, *, reason: str = "startup_cleanup_all") -> int:
@@ -215,7 +215,7 @@ class OrderManager:
             if not mo.is_terminal():
                 to_cancel.append(mo)
 
-        self.log.warning("B6: cancel_all_open_orders reason=%s count=%d", reason, len(to_cancel))
+        self.log.warning("cancel_all_open_orders reason=%s count=%d", reason, len(to_cancel))
 
         attempted = 0
         for mo in to_cancel:
@@ -223,7 +223,7 @@ class OrderManager:
             try:
                 self.cancel(order_id=mo.exchange_order_id, client_order_id=None if mo.exchange_order_id else mo.client_order_id)
             except Exception as e:
-                self.log.warning("B6: failed to cancel clientId=%s oid=%s: %s", mo.client_order_id, mo.exchange_order_id, e)
+                self.log.warning("failed to cancel clientId=%s oid=%s: %s", mo.client_order_id, mo.exchange_order_id, e)
         return attempted
 
 
@@ -269,7 +269,7 @@ class OrderManager:
             if mo.exchange_order_id is not None:
                 self._by_order_id[mo.exchange_order_id] = mo
 
-        self.log.info("B6: reconciled open orders: %d", len(self._by_client_id))
+        self.log.debug("reconciled open orders: %d", len(self._by_client_id))
 
     # -----------------------
     # Submission helpers
@@ -299,7 +299,7 @@ class OrderManager:
         existing = self._by_client_id.get(client_id)
         if existing and not existing.is_terminal():
             self.log.info(
-                "B6: idempotent hit -> reuse existing order clientId=%s status=%s",
+                "idempotent hit -> reuse existing order clientId=%s status=%s",
                 client_id,
                 existing.status,
             )
@@ -330,7 +330,7 @@ class OrderManager:
             )
         except Exception as e:
             self.log.warning(
-                "B6: place_limit failed (clientId=%s): %s -> trying get_order by client id",
+                "place_limit failed (clientId=%s): %s -> trying get_order by client id",
                 client_id,
                 e,
             )
@@ -384,7 +384,7 @@ class OrderManager:
         existing = self._by_client_id.get(client_id)
         if existing and not existing.is_terminal():
             self.log.info(
-                "B6: idempotent hit -> reuse existing MARKET clientId=%s status=%s",
+                "idempotent hit -> reuse existing MARKET clientId=%s status=%s",
                 client_id,
                 existing.status,
             )
@@ -413,7 +413,7 @@ class OrderManager:
             )
         except Exception as e:
             self.log.warning(
-                "B6: place_market failed (clientId=%s): %s -> trying get_order by client id",
+                "place_market failed (clientId=%s): %s -> trying get_order by client id",
                 client_id,
                 e,
             )
@@ -516,7 +516,7 @@ class OrderManager:
                 self._by_order_id[oid] = mo
 
             self.log.warning(
-                "B6: executionReport for unknown order -> now tracking clientId=%s oid=%s",
+                "executionReport for unknown order -> now tracking clientId=%s oid=%s",
                 mo.client_order_id,
                 oid,
             )
@@ -530,7 +530,7 @@ class OrderManager:
 
         if mo.is_terminal():
             self.log.info(
-                "B6: order terminal clientId=%s status=%s cumQty=%.8f",
+                "order terminal clientId=%s status=%s cumQty=%.8f",
                 mo.client_order_id,
                 mo.status,
                 mo.cum_qty,
