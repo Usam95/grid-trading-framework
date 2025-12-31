@@ -1,38 +1,64 @@
-name: "xrp_live_phase_a"
-description: "Phase A: stream closed candles from Binance WS and log them."
+name: "xrp_paper_trade"
+description: "Paper trading on Binance Spot Testnet (1m candles)."
 
-mode: paper   # paper => Spot Testnet websocket by default
+mode: paper
 
 data:
   source: binance
   symbol: "XRPUSDT"
   timeframe: "1m"
-  # use_testnet_ws: true   # optional override (defaults to true when mode: paper)
+  # use_testnet_ws: true  # optional override
 
 engine:
   initial_balance: 1000.0
   initial_base_qty: 0.0
-  trading_fee_pct: 0.001
-  slippage_pct: 0.0
-  max_candles: null
   reservations:
     enabled: true
   constraints:
     enabled: true
     insufficient_funds_mode: "skip"
     min_order_qty: 5.0
+  bootstrap:
+    mode: "long_only"
 
 strategy:
-  kind: "grid.simple"
+  kind: "grid.dynamic"     # or grid.simple
   symbol: "XRPUSDT"
   base_order_size: 10.0
-  n_levels: 10
+  n_levels: 15
   range_mode: "percent"
-  lower_pct: 0.1
-  upper_pct: 0.1
+  lower_pct: 0.10
+  upper_pct: 0.10
   spacing: "arithmetic"
+  spacing_mode: "percent"
+  spacing_pct: 0.007
+  # ...
+
+trading:
+  enabled: true
+  require_private_endpoints: true
+
+  user_stream:
+    enabled: true
+    keepalive_interval_sec: 1800
+    reconnect_backoff_sec: 5
+
+  safety:
+    max_open_orders: 40
+    max_notional_per_order: 50.0
+    max_position_base: 10000.0
+    cancel_all_on_shutdown: true
+
+  startup_orders:
+    cancel_open_orders_on_startup: true
+    cancel_open_orders_only_managed: true
+    cancel_open_orders_prefixes: ["GT-", "LT-", "LT_"]
+
+  balances_log_assets: ["USDT", "XRP", "BNB"]
+
+
 
 logging:
-  name: "live"
+  name: "paper"
   level: "INFO"
   log_dir: "logs"
