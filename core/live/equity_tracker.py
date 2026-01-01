@@ -1,7 +1,7 @@
 # core/live/equity_tracker.py
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict, is_dataclass
+from dataclasses import dataclass, asdict
 from typing import Any, Optional, Tuple
 
 from core.models import AccountState
@@ -21,7 +21,7 @@ class EquityTracker:
         self.last_price: float = 0.0
 
     def _split_symbol(self, symbol: str) -> Tuple[str, str]:
-        # For now: assume ...USDT. Later: use exchangeInfo baseAsset/quoteAsset.
+        # For now: assume .USDT. Later: use exchangeInfo baseAsset/quoteAsset.
         if symbol.endswith("USDT"):
             return symbol[:-4], "USDT"
         raise ValueError(f"Unsupported symbol split for {symbol}")
@@ -54,26 +54,19 @@ class EquityTracker:
         return px, Balance(float(b_free), float(b_locked)), Balance(float(q_free), float(q_locked))
 
     # ---------------------------------------------------------------------
-    # Compatibility API
+    # Compatibility API (runtime expects this)
     # ---------------------------------------------------------------------
     def refresh(self, *, last_price: float) -> None:
-        """
-        Called by runtime on each candle close. Just cache the price.
-        """
         self.last_price = float(last_price)
 
     def snapshot_json(self) -> dict[str, Any]:
-        px, b, q = self.snapshot()
+        px, b, q = self.snapshot(last_price=self.last_price if self.last_price > 0 else None)
         return {
-            "symbol": self.symbol,
             "price": float(px),
-            "base": asdict(b) if is_dataclass(b) else b,
-            "quote": asdict(q) if is_dataclass(q) else q,
+            "base": asdict(b),
+            "quote": asdict(q),
         }
 
-    # ---------------------------------------------------------------------
-    # Strategy boundary convenience (optional)
-    # ---------------------------------------------------------------------
     def account_state(self) -> AccountState:
         bals = self.exchange.get_balances(non_zero_only=False)
         b_free, b_locked = bals.get(self.base, (0.0, 0.0))
@@ -91,7 +84,7 @@ class EquityTracker:
         return AccountState(
             cash_balance=cash_balance,
             total_value=total_value,
-            invested_cost=0.0,  # until you track cost basis via fills
+            invested_cost=0.0,  # will be filled by the PnL ledger (A4)
             base_free=float(b_free),
             base_locked=float(b_locked),
             quote_free=float(q_free),

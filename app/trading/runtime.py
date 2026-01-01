@@ -18,7 +18,9 @@ from core.strategy.base import BaseStrategy
 from core.models import OrderFilledEvent, Side
 from core.live.order_manager import OrderManager, decode_grid_tag_from_client_order_id
 from core.live.equity_tracker import EquityTracker
-
+from typing import Optional
+# add near other imports
+from core.live.pnl_ledger import FillLedger, BuyHoldBaseline
 from app.trading.config import TradingSettings, resolve_use_testnet_ws
 from app.trading.utils import utcnow_iso, mask_secret, split_symbol, to_float, ms_to_dt_utc
 from app.trading.user_stream import start_user_stream
@@ -64,9 +66,43 @@ class TradingContext:
     exec_reports: Queue[Dict[str, Any]] = field(default_factory=Queue)
     fill_events: Queue[OrderFilledEvent] = field(default_factory=Queue)
 
+    # inside TradingContext dataclass
+    pnl_ledger: Optional[FillLedger] = None
+    buyhold: Optional[BuyHoldBaseline] = None
+
+
     @property
     def trading(self):
         return self.settings.trading
+
+def persist_pnl(ctx: TradingContext, *, reason: str, last_price: Optional[float] = None) -> None:
+    if ctx.pnl_ledger is None or ctx.buyhold is None:
+        return
+    try:
+        px = float(last_price) if (last_price is not None and float(last_price) > 0.0) else float(ctx.pnl_ledger.start_price)
+        snap = ctx.pnl_ledger.snapshot(last_price=px)
+
+        bh_eq = ctx.buyhold.equity(last_price=px)
+        bh_ret = ctx.buyhold.return_pct(last_price=px)
+
+        ctx.repo.append_pnl(
+            symbol=ctx.symbol,
+            price=float(px),
+            cash_quote=float(snap["cash_quote"]),
+            base_position=float(snap["base_position"]),
+            invested_cost_quote=float(snap["invested_cost_quote"]),
+            fees_paid_quote=float(snap["fees_paid_quote"]),
+            realized_pnl_quote=float(snap["realized_pnl_quote"]),
+            unrealized_pnl_quote=float(snap["unrealized_pnl_quote"]),
+            total_pnl_quote=float(snap["total_pnl_quote"]),
+            ledger_equity_quote=float(snap["ledger_equity_quote"]),
+            buyhold_equity_quote=float(bh_eq),
+            buyhold_return_pct=float(bh_ret),
+            reason=str(reason),
+        )
+        ctx.repo.append_event("pnl.persisted", {"reason": reason, "price": float(px)})
+    except Exception as e:
+        ctx.repo.append_event("pnl.persist_failed", {"reason": reason, "error": str(e)})
 
 def persist_equity(ctx: TradingContext, *, reason: str, last_price: Optional[float] = None) -> None:
     if ctx.equity is None:
@@ -83,7 +119,6 @@ def persist_equity(ctx: TradingContext, *, reason: str, last_price: Optional[flo
         )
         ctx.repo.append_event("equity.persisted", {"reason": reason, "price": float(px)})
     except Exception as e:
-        # DO NOT swallow: this is how we debug "equity.csv only one row"
         ctx.repo.append_event("equity.persist_failed", {"reason": reason, "error": str(e)})
 
 
@@ -194,6 +229,10 @@ def pump_async_events(ctx: TradingContext, *, max_reports: int = 1000, max_fills
 
         _persist_execution_report(ctx, evt)
 
+        if getattr(ctx, "pnl", None) is not None:
+            ctx.pnl.on_execution_report(evt)
+
+
         if ctx.order_mgr is not None:
             try:
                 ctx.order_mgr.on_execution_report(evt)
@@ -217,6 +256,11 @@ def pump_async_events(ctx: TradingContext, *, max_reports: int = 1000, max_fills
                 "strategy.on_order_filled",
                 {"order_id": ofe.order_id, "tag": ofe.client_tag, "qty": ofe.qty, "price": ofe.price},
             )
+
+            if ctx.pnl_ledger is not None:
+                ctx.pnl_ledger.on_fill(ofe)  # fee derived from fee_pct for now
+                persist_pnl(ctx, reason="fill", last_price=float(getattr(ctx.equity, "last_price", ofe.price)))
+
         except Exception:
             pass
 
@@ -369,7 +413,39 @@ def _setup_private(ctx: TradingContext) -> None:
 
     try:
         ctx.equity = EquityTracker(exchange=ctx.exchange, symbol=ctx.symbol)
+
         px, b, q = ctx.equity.snapshot()
+        fee_pct = float(getattr(ctx.settings.run_cfg.engine, "trading_fee_pct", 0.0) or 0.0)
+
+        initial_base = float(b.free + b.locked)
+        initial_quote = float(q.free + q.locked)
+
+        ctx.pnl_ledger = FillLedger(
+            symbol=ctx.symbol,
+            fee_pct=fee_pct,
+            initial_quote=initial_quote,
+            initial_base=initial_base,
+            start_price=float(px),
+        )
+
+        ctx.buyhold = BuyHoldBaseline(
+            initial_quote=initial_quote,
+            initial_base=initial_base,
+            start_price=float(px),
+            fee_pct=fee_pct,
+        )
+
+        ctx.repo.append_event(
+            "pnl.ledger.init",
+            {
+                "fee_pct": fee_pct,
+                "initial_quote": initial_quote,
+                "initial_base": initial_base,
+                "start_price": float(px),
+            },
+        )
+
+        persist_pnl(ctx, reason="startup", last_price=float(px))
         ctx.repo.append_event(
             "equity.snapshot",
             ctx.equity.snapshot_json() if hasattr(ctx.equity, "snapshot_json") else {"price": px},
@@ -382,6 +458,10 @@ def _setup_private(ctx: TradingContext) -> None:
             quote_free=float(getattr(q, "free", 0.0)),
             quote_locked=float(getattr(q, "locked", 0.0)),
         )
+        
+        ctx.pnl.seed_from_balance(base_qty=b.total, price=px)
+        ctx.repo.append_event("pnl.ledger.init", ctx.pnl.snapshot(price=px).__dict__)
+
     except Exception as e:
         ctx.log.warning("EquityTracker init failed (%s). Will use REST fallback.", e)
         ctx.equity = None
@@ -572,6 +652,7 @@ def run_trading(settings: TradingSettings) -> None:
                 ctx.equity.refresh(last_price=float(candle.close))
 
             persist_equity(ctx, reason="candle_closed", last_price=float(candle.close))
+            persist_pnl(ctx, reason="candle_closed", last_price=float(candle.close))
 
             if not ctx.has_private_creds:
                 ctx.repo.append_event("strategy.skipped", {"reason": "missing_private_creds"})

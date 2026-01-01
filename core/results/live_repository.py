@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import csv
 import json
-import os
 from dataclasses import dataclass, is_dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +21,7 @@ class LiveRunPaths:
     orders_csv: Path
     fills_csv: Path
     equity_csv: Path
+    pnl_csv: Path
     events_jsonl: Path
 
 
@@ -44,13 +44,14 @@ class LiveRepository:
             orders_csv=root / "orders.csv",
             fills_csv=root / "fills.csv",
             equity_csv=root / "equity.csv",
+            pnl_csv=root / "pnl.csv",
             events_jsonl=root / "events.jsonl",
         )
 
         self._events_lock = Lock()
+        self._csv_lock = Lock()
         self._init_csvs()
 
-        # ensure events file exists
         self.paths.events_jsonl.touch(exist_ok=True)
 
     def _init_csvs(self) -> None:
@@ -73,84 +74,29 @@ class LiveRepository:
                     ["ts", "symbol", "price", "base_free", "base_locked", "quote_free", "quote_locked", "equity_quote"]
                 )
 
+        if not self.paths.pnl_csv.exists():
+            with self.paths.pnl_csv.open("w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(
+                    [
+                        "ts", "symbol", "price",
+                        "cash_quote", "base_position",
+                        "invested_cost_quote",
+                        "fees_paid_quote",
+                        "realized_pnl_quote", "unrealized_pnl_quote", "total_pnl_quote",
+                        "ledger_equity_quote",
+                        "buyhold_equity_quote", "buyhold_return_pct",
+                        "reason",
+                    ]
+                )
+
     def write_session(self, payload: Dict[str, Any]) -> None:
         self.paths.session_json.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    # ---------------------------------------------------------------------
-    # Events (JSONL) - thread-safe
-    # ---------------------------------------------------------------------
-    def append_event(self, *args: Any) -> None:
-        """
-        Supports BOTH call styles:
-
-        1) append_event({"type": "...", "payload": {...}})
-        2) append_event("type.name", {...})
-
-        But now it is thread-safe and writes exactly one line atomically.
-        """
-        if len(args) == 1 and isinstance(args[0], dict):
-            event = dict(args[0])
-        elif len(args) == 2 and isinstance(args[0], str):
-            event = {"type": args[0], "payload": args[1]}
-        else:
-            raise TypeError("append_event expects either (dict) or (event_type: str, payload: Any)")
-
-        event.setdefault("ts", _utcnow().isoformat())
-        line = json.dumps(event, default=self._json_default, ensure_ascii=False, separators=(",", ":")) + "\n"
-
-        # Serialize concurrent writers (user stream thread + main loop)
+    def append_event(self, event: str, payload: Any) -> None:
         with self._events_lock:
-            with self.paths.events_jsonl.open("a", encoding="utf-8", newline="\n") as f:
-                f.write(line)
-                f.flush()
-                os.fsync(f.fileno())
-
-    # ---------------------------------------------------------------------
-    # Equity
-    # ---------------------------------------------------------------------
-    def append_equity(
-        self,
-        *,
-        symbol: str,
-        price: float,
-        base_free: float,
-        base_locked: float,
-        quote_free: float,
-        quote_locked: float,
-    ) -> None:
-        equity = (quote_free + quote_locked) + (base_free + base_locked) * price
-        with self.paths.equity_csv.open("a", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(
-                [
-                    _utcnow().isoformat(),
-                    symbol,
-                    f"{price:.8f}",
-                    f"{base_free:.8f}",
-                    f"{base_locked:.8f}",
-                    f"{quote_free:.8f}",
-                    f"{quote_locked:.8f}",
-                    f"{equity:.8f}",
-                ]
-            )
-    @staticmethod
-    def _json_default(o: Any) -> Any:
-        """
-        Make events JSONL robust:
-          - dataclasses (e.g., Balance) -> dict
-          - datetime -> iso string
-          - sets -> list
-          - fallback -> string
-        """
-        if is_dataclass(o):
-            return asdict(o)
-        if isinstance(o, datetime):
-            return o.isoformat()
-        if isinstance(o, set):
-            return list(o)
-        # last resort (never crash logging)
-        return str(o)
-    
+            with self.paths.events_jsonl.open("a", encoding="utf-8") as f:
+                rec = {"ts": _utcnow().isoformat(), "event": event, "payload": self._jsonify(payload)}
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     def append_order(
         self,
@@ -164,19 +110,21 @@ class LiveRepository:
         qty: float,
         price: float,
     ) -> None:
-        with self.paths.orders_csv.open("a", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow([
-                _utcnow().isoformat(),
-                symbol,
-                side,
-                order_type,
-                client_order_id,
-                exchange_order_id,
-                status,
-                f"{qty:.8f}",
-                f"{price:.8f}",
-            ])
+        with self._csv_lock:
+            with self.paths.orders_csv.open("a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(
+                    [
+                        _utcnow().isoformat(),
+                        symbol,
+                        side,
+                        order_type,
+                        client_order_id,
+                        exchange_order_id,
+                        status,
+                        float(qty),
+                        float(price),
+                    ]
+                )
 
     def append_fill(
         self,
@@ -191,17 +139,92 @@ class LiveRepository:
         cum_qty: float,
         cum_quote: float,
     ) -> None:
-        with self.paths.fills_csv.open("a", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow([
-                _utcnow().isoformat(),
-                symbol,
-                side,
-                order_type,
-                client_order_id,
-                exchange_order_id,
-                f"{fill_qty:.8f}",
-                f"{fill_price:.8f}",
-                f"{cum_qty:.8f}",
-                f"{cum_quote:.8f}",
-            ])
+        with self._csv_lock:
+            with self.paths.fills_csv.open("a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(
+                    [
+                        _utcnow().isoformat(),
+                        symbol,
+                        side,
+                        order_type,
+                        client_order_id,
+                        exchange_order_id,
+                        float(fill_qty),
+                        float(fill_price),
+                        float(cum_qty),
+                        float(cum_quote),
+                    ]
+                )
+
+    def append_equity(
+        self,
+        *,
+        symbol: str,
+        price: float,
+        base_free: float,
+        base_locked: float,
+        quote_free: float,
+        quote_locked: float,
+    ) -> None:
+        equity_quote = float(quote_free + quote_locked) + float(base_free + base_locked) * float(price)
+        with self._csv_lock:
+            with self.paths.equity_csv.open("a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(
+                    [
+                        _utcnow().isoformat(),
+                        symbol,
+                        float(price),
+                        float(base_free),
+                        float(base_locked),
+                        float(quote_free),
+                        float(quote_locked),
+                        float(equity_quote),
+                    ]
+                )
+
+    def append_pnl(
+        self,
+        *,
+        symbol: str,
+        price: float,
+        cash_quote: float,
+        base_position: float,
+        invested_cost_quote: float,
+        fees_paid_quote: float,
+        realized_pnl_quote: float,
+        unrealized_pnl_quote: float,
+        total_pnl_quote: float,
+        ledger_equity_quote: float,
+        buyhold_equity_quote: float,
+        buyhold_return_pct: float,
+        reason: str,
+    ) -> None:
+        with self._csv_lock:
+            with self.paths.pnl_csv.open("a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(
+                    [
+                        _utcnow().isoformat(),
+                        symbol,
+                        float(price),
+                        float(cash_quote),
+                        float(base_position),
+                        float(invested_cost_quote),
+                        float(fees_paid_quote),
+                        float(realized_pnl_quote),
+                        float(unrealized_pnl_quote),
+                        float(total_pnl_quote),
+                        float(ledger_equity_quote),
+                        float(buyhold_equity_quote),
+                        float(buyhold_return_pct),
+                        str(reason),
+                    ]
+                )
+
+    def _jsonify(self, obj: Any) -> Any:
+        if is_dataclass(obj):
+            return asdict(obj)
+        if isinstance(obj, (list, tuple)):
+            return [self._jsonify(x) for x in obj]
+        if isinstance(obj, dict):
+            return {str(k): self._jsonify(v) for k, v in obj.items()}
+        return obj

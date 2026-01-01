@@ -25,7 +25,7 @@ strategy:
   kind: "grid.dynamic"     # or grid.simple
   symbol: "XRPUSDT"
   base_order_size: 10.0
-  n_levels: 15
+  n_levels: 40
   range_mode: "percent"
   lower_pct: 0.10
   upper_pct: 0.10
