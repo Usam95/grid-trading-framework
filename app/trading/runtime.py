@@ -459,8 +459,8 @@ def _setup_private(ctx: TradingContext) -> None:
             quote_locked=float(getattr(q, "locked", 0.0)),
         )
         
-        ctx.pnl.seed_from_balance(base_qty=b.total, price=px)
-        ctx.repo.append_event("pnl.ledger.init", ctx.pnl.snapshot(price=px).__dict__)
+        ctx.pnl_ledger.seed_from_balance(base_qty=b.total, price=px)
+        ctx.repo.append_event("pnl.ledger.init", ctx.pnl_ledger.snapshot(price=px).__dict__)
 
     except Exception as e:
         ctx.log.warning("EquityTracker init failed (%s). Will use REST fallback.", e)

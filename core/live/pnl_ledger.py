@@ -203,3 +203,20 @@ class FillLedger:
             "initial_equity_quote": float(initial_equity),
             "total_pnl_quote": float(total_pnl),
         }
+
+    def seed_from_balance(self, *, base_qty: float, price: float) -> None:
+        base_qty = float(base_qty)
+        price = float(price)
+        if price <= 0.0:
+            raise ValueError("seed_from_balance: price must be > 0")
+
+        # Reset starting point to current wallet state
+        self.initial_base = base_qty
+        self.start_price = price
+        self._base_position = base_qty
+
+        self._lots_by_tag.clear()
+        if base_qty > 0.0:
+            self._lots_by_tag["__seed__"] = [
+                Lot(qty=base_qty, entry_price=price, entry_fee_quote=0.0, opened_at=self.opened_at)
+            ]
